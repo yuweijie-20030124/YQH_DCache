@@ -3,4 +3,8 @@ package YQH
 import chisel3._
 import chisel3.util._
 
-abstract class YQHBundle extends Bundle
+import YQH.cache.HasDCacheParameters
+
+abstract class YQHBundle extends Bundle with HasDCacheParameters
+abstract class YQHModule extends Module with HasDCacheParameters
+
