@@ -1,5 +1,34 @@
 {
+    // 与 build.sc 中的 Scala 版本一致，自动导入 Mill 构建。
+    "metals.autoImportBuilds": "all",
+    "metals.fallbackScalaVersion": "2.12.18",
+    "editor.renderValidationDecorations": "on",
+    // mill / Metals 的产物目录，避免 watcher 抖动
     "files.watcherExclude": {
-        "**/target/**": true
+        "**/target/**": true,
+        "**/out/**": true,
+        "**/build/**": true
+    },
+
+    // ---- 补全：尽量边打边弹 ----
+    "editor.quickSuggestions": {
+        "other": "on",
+        "comments": "off",
+        "strings": "off"
+    },
+    "editor.quickSuggestionsDelay": 0,
+    "editor.suggestOnTriggerCharacters": true,
+    "editor.suggest.matchOnWordStartOnly": false,
+    "editor.suggest.filterGraceful": true,
+    "editor.suggest.showSnippets": true,
+    "editor.suggest.insertMode": "replace",
+    "editor.acceptSuggestionOnEnter": "on",
+    "editor.tabCompletion": "onlySnippets",
+    "editor.parameterHints.enabled": true,
+    "editor.wordBasedSuggestions": "matchingDocuments",
+
+    "[scala]": {
+        "editor.quickSuggestions": { "other": "on" },
+        "editor.suggest.showWords": true
     }
 }
