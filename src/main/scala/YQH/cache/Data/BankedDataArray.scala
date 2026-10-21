@@ -8,10 +8,25 @@ import YQH.YQHBundle
 // utils
 class L1BankedDataReadReq(implicit p: DCacheParameters) extends DCacheBundle
 {
-  val way_en = Bits(p.nways.W)
+  val way_en = Bits(nways.W)
   val addr = Bits(p.PAddrBits.W)
 }
 
+class L1BankedDataReadReqWithMask(implicit p: DCacheParameters) extends DCacheBundle
+{
+  val way_en = Bits(nways.W)
+  val addr = Bits(PAddrBits.W)
+  val addr_dup = Bits(PAddrBits.W)
+  val bankMask = Bits(DCacheBanks.W)
+  val kill = Bool()
+  val lqIdx = new LqPtr
+}
+
+class L1BankedDataReadResult(implicit p: DCacheParameters) extends DCacheBundle
+{
+  // you can choose which bank to read to save power
+  val raw_data = Bits(XLEN.W)
+}
 // class L1BankedDataReadReqWithMask(implicit p: DCacheParameters) extends DCacheBundle
 // {
 //   val way_en = Bits(DCacheWays.W)

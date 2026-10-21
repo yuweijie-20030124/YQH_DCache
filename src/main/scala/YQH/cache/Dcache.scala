@@ -21,7 +21,7 @@ class ReplayCarry(nWays: Int)(implicit p: DCacheParameters) extends DCacheBundle
 
 class LqPtr(implicit p: DCacheParameters) extends DCacheBundle{
   //empty
-  val PTR_WIDTH = log2Up(lqentries)
+  val PTR_WIDTH = log2Up(nLQEntries)
   val flag = Bool()
   val value = UInt(PTR_WIDTH.W)
 }
@@ -39,6 +39,11 @@ class DCacheWordReq(implicit p:DCacheParameters) extends DCacheBundle{
   val lqIdx = new LqPtr //年龄判断bank conflict的时候可以选择老load。
 }
 
+/****************************meta relative****************************/
+class DCacheExtraMeta(implicit p:DCacheParameters) extends DCacheBundle{
+  val access = Bool()
+}
+
 class DCacheWordResp(implicit p:DCacheParameters) extends DCacheBundle{
   val data = UInt(VLEN.W) //标量data，没有向量。128bit
   val id     = UInt(reqIdWidth.W) //Dcache请求/响应的id字段位宽 暂时不知道多少先填一个6
@@ -52,6 +57,47 @@ class DCacheWordResp(implicit p:DCacheParameters) extends DCacheBundle{
   val replacementUpdated = Bool()
 }
 
+class DcacheStoreRequestIO(implicit p: DCacheParameters) extends DCacheBundle {
+  val cmd = UInt(M_SZ.W)
+  val vaddr = UInt(VAddrBits.W)
+  val instrtype   = UInt(sourceTypeWidth.W)
+}
+
+class DCacheLineResp(implicit p: DCacheParameters) extends DCacheBundle {
+  // val data   = UInt((cfg.blockBytes * 8).W)
+  // cache req missed, send it to miss queue
+  val miss   = Bool()
+  // cache req nacked, replay it later
+  val replay = Bool()
+  val id     = UInt(reqIdWidth.W)
+}
+
+class DCacheLineReq(implicit p: DCacheParameters) extends DCacheBundle {
+  val cmd    = UInt(M_SZ.W)
+  val vaddr  = UInt(VAddrBits.W)
+  val addr   = UInt(PAddrBits.W)
+  // val data   = UInt((cfg.blockBytes * 8).W)
+  // val mask   = UInt(cfg.blockBytes.W)
+  val id     = UInt(reqIdWidth.W)
+}
+
+class DCacheWordIO(implicit p:DCacheParameters) extends DCacheBundle{
+  val req  = DecoupledIO(new DCacheWordReq)
+  val resp = Flipped(DecoupledIO(new DCacheWordResp))
+}
+
+// Replacement
+class ReplacementAccessBundle(implicit p: DCacheParameters) extends DCacheBundle {
+  val set = UInt(log2Up(nsets).W)
+  val way = UInt(log2Up(nways).W)
+}
+
+class ReplacementWayReqIO(implicit p: DCacheParameters) extends DCacheBundle {
+  val set = ValidIO(UInt(log2Up(nsets).W))
+  val dmWay = Output(UInt(log2Up(nways).W))
+  val way = Input(UInt(log2Up(nways).W))
+}
+
 /***********************************interface definition***********************************/ 
   
 /**
@@ -59,19 +105,60 @@ class DCacheWordResp(implicit p:DCacheParameters) extends DCacheBundle{
   */
 
 // loadpipe interface for whole store
-class DCacheLoadIO(implicit p:DCacheParameters) extends DCacheBundle{
-  val req  = DecoupledIO(new DCacheWordReq)
-  val resp = Flipped(DecoupledIO(new DCacheWordResp))
+class DCacheLoadIO(implicit p: DCacheParameters) extends DCacheWordIO
+{
+  val s1_kill_data_read = Output(Bool()) 
+  val s1_kill           = Output(Bool()) 
+  val s2_kill           = Output(Bool())
+  val s0_pc             = Output(UInt(VAddrBits.W))
+  val s1_pc             = Output(UInt(VAddrBits.W))
+  val s2_pc             = Output(UInt(VAddrBits.W))
+  val replacementUpdated = Output(Bool())
+  val is128Req = Bool()
+  val s1_paddr_dup_lsu = Output(UInt(PAddrBits.W)) 
+  val s1_paddr_dup_dcache = Output(UInt(PAddrBits.W)) 
+  val s1_disable_fast_wakeup = Input(Bool())
+  val s2_hit = Input(Bool()) 
+  val s2_first_hit = Input(Bool())
+  val s2_bank_conflict = Input(Bool())
+  val s2_wpu_pred_fail = Input(Bool())
+  val s2_mq_nack = Input(Bool())
 }
 
 // storepipe interface for store address check
 class DCacheStoreIO(implicit p:DCacheParameters) extends DCacheBundle{
+  // Paddr in STA s1, used for hit check
+  val s1_paddr = Output(UInt(PAddrBits.W))
+  // TLB miss or Exception in STA s1, kill Dcache req
+  val s1_kill = Output(Bool())
+  // Access Fault or MMIO in STA s2, kill Dcache req
+  val s2_kill = Output(Bool())
+  // Debug PC
+  val s2_pc = Output(UInt(VAddrBits.W))
 
+  val req = DecoupledIO(new DcacheStoreRequestIO)
+  val resp = Flipped(DecoupledIO(new DCacheBundle() {
+    // this store misses (for now, not used)
+    val miss = Bool()
+    // this store needs replay (for now, not used)
+    val replay = Bool()
+    // tag error TODO: add logic
+    val tag_error = Bool()
+  }))
 }
 
 // storebuffer to DCache interface for store(date + address)
 class DCacheToSbufferIO(implicit p:DCacheParameters) extends DCacheBundle{
+  // sbuffer will directly send request to dcache main pipe
+  val req = Flipped(Decoupled(new DCacheLineReq))
 
+  val main_pipe_hit_resp = ValidIO(new DCacheLineResp)
+  //val refill_hit_resp = ValidIO(new DCacheLineResp)
+
+  val replay_resp = ValidIO(new DCacheLineResp)
+
+  //def hit_resps: Seq[ValidIO[DCacheLineResp]] = Seq(main_pipe_hit_resp, refill_hit_resp)
+  def hit_resps: Seq[ValidIO[DCacheLineResp]] = Seq(main_pipe_hit_resp)
 }
 
 // atomics interface for atomicunit 

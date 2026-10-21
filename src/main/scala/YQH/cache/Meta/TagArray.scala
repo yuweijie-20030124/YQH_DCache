@@ -10,7 +10,7 @@ import YQH.utils.SRAMTemplate
 // read tag
 class TagReadReq(implicit p: DCacheParameters) extends DCacheBundle {
     val idx = UInt(idxBits.W)        // idxBits 来自 HasDCacheParameters
-    val way_en = UInt(p.nways.W)     // 每路 1 bit
+    val way_en = UInt(nways.W)     // 每路 1 bit
 }
 
 // write tag

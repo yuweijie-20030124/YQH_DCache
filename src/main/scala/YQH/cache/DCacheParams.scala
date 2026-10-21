@@ -12,19 +12,24 @@ import chisel3.util._
 
 case class DCacheParameters(
     nSets       :Int = 256   ,
-    nways       :Int = 4     ,
+    nWays       :Int = 4     ,
     blockBytes  :Int = 64    ,
     rowBits     :Int = 64    ,
     nMissEntries:Int = 8     ,
 
-    //bank
+    //dcache大小 = 256set * 4 way * 512bit = 64kb
 
+    //bank
+    nBanks       :Int = 8    ,
     // tag
     tagBits     :Int = 48-13 ,
     vtagBits    :Int = 48-12 ,
 
     //loadpipe个数。
     LoadPipelineWidth:Int = 3,
+
+    // MSHR
+
 
     //OUTSIDE (SoC / Core设置)
     PAddrBits   :Int  = 48  ,
@@ -56,20 +61,79 @@ trait HasDCacheParameters{
   def idxBits = log2Up(p.nSets)
   
   // val赋值
-  val nways         = p.nways
+  val nsets         = p.nSets
+  val nways         = p.nWays
+  val blockBytes    = p.blockBytes
+  val blockOffBits  = log2Up(blockBytes)
   val nMissEntries  = p.nMissEntries
   val reqIdWidth    = 6 //Dcache请求/响应的id字段位宽 暂时不知道多少,我先填一个6
-  // bankded dcache support
+  val tagBits       = p.tagBits
+  // banked dcache support
   def DCacheSets     = p.nSets        // 不再硬编码
-  def DCacheWordBits = p.rowBits
-  
+  def DCacheWordBits = p.rowBits      // 一个 bank 一次读写的数据位宽
+  val DCacheBanks    = p.nBanks       // dcache 中 bank 的数量
+
+  // 地址位段：
+  // [ tag | set | bank | bank 内字节偏移 ]
+  // bank 内字节偏移由一个 row 的大小决定；set 位段位于 bank 位段之上。
+  val DCacheWordBytes  = DCacheWordBits / 8
+  val DCacheBankBits   = log2Ceil(DCacheBanks)
+  val DCacheBankOffset = log2Ceil(DCacheWordBytes)
+  val DCacheSetBits    = log2Ceil(DCacheSets)
+  val DCacheSetOffset  = DCacheBankOffset + DCacheBankBits + DCacheSetBits
+
+
+  require(DCacheWordBits % 8 == 0)
+  require(DCacheBanks > 0 && (1 << DCacheBankBits) == DCacheBanks)
+  require(DCacheSets > 0 && (1 << DCacheSetBits) == DCacheSets)
+  require(p.blockBytes == DCacheBanks * DCacheWordBytes)
+
   // SoC
+  // XLEN 必须在所有依赖它的字段之前初始化。否则 HasDCacheParameters
+  // 在 Bundle 的父类构造阶段计算 blockWords 时会触发 -Xcheckinit。
   val PAddrBits = p.PAddrBits
   val VAddrBits = p.VAddrBits
-  val XLEN      = p.XLEN  
+  val XLEN      = p.XLEN
   val VLEN      = 128
-  val lqentries = 16
-  
+
+  // MSHR
+  val blockWords     = XLEN / 8
+
+  // amo
+  val QuadWordBits   = 2 * XLEN
+  val QuadWordBytes  = QuadWordBits / 8
+  val nLQEntries= 16
+
+  // 方法定义 def 帮助取值，其实感觉相当于verilog中的function
+  // 取 bank 编号。例如当前配置下：addr(5, 3)，结果宽度为 3 bit。
+  def addr_to_dcache_bank(addr: UInt): UInt = {
+    require(addr.getWidth >= DCacheBankOffset + DCacheBankBits)
+    addr(DCacheBankOffset + DCacheBankBits - 1, DCacheBankOffset)
+  }
+
+  // 取 cache set 编号。例如当前配置下：addr(13, 6)，结果宽度为 8 bit。
+  def addr_to_dcache_set(addr: UInt): UInt = {
+    require(addr.getWidth >= DCacheSetOffset)
+    addr(DCacheSetOffset - 1, DCacheBankOffset + DCacheBankBits)
+  }
+
+  // 取 cache set 的 index。
+  // idx 的低位紧接在 bank 位之后，高位由 set 位宽决定。
+  // 当前配置下等价于 addr(13, 6)，结果宽度为 DCacheSetBits = 8 bit。
+  def get_idx(addr: UInt): UInt = {
+    val idxLo = DCacheBankOffset + DCacheBankBits
+    val idxHi = idxLo + DCacheSetBits - 1
+    require(addr.getWidth >= idxHi + 1)
+    addr(idxHi, idxLo)
+  }
+
+  // 从物理地址中提取与 TagArray 宽度一致的 tag。
+  def get_tag(addr: UInt): UInt = {
+    require(addr.getWidth >= PAddrBits)
+    addr(PAddrBits - 1, PAddrBits - tagBits)
+  }
+
+
 }
 
 trait MemoryOpConstants {
