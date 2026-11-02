@@ -25,6 +25,11 @@ class LqPtr(implicit p: DCacheParameters) extends DCacheBundle{
   val PTR_WIDTH = log2Up(nLQEntries)
   val flag = Bool()
   val value = UInt(PTR_WIDTH.W)
+
+  // 环形队列年龄。flag 相同则 value 小的更老；flag 不同则 value 大的更老。
+  def isOlderThan(that: LqPtr): Bool = {
+    Mux(flag === that.flag, value < that.value, value > that.value)
+  }
 }
 
 class DCacheWordReq(implicit p:DCacheParameters) extends DCacheBundle{
