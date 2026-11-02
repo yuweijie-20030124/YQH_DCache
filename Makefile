@@ -37,7 +37,7 @@ TOP_V     := $(RTL_DIR)/$(TOPNAME).v
 
 # ------------------------------------------------------------------ 源文件 --
 SCALA_FILES := $(shell find src/main -name '*.scala')
-CSRCS       := $(shell find $(abspath sim_c) -name '*.c' -o -name '*.cc' -o -name '*.cpp')
+CSRCS       := $(if $(wildcard sim_c),$(shell find $(abspath sim_c) -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \)),)
 
 # ------------------------------------------------------------------ 工具 --
 VERILATOR ?= verilator
