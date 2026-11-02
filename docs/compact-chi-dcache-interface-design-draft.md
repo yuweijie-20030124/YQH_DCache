@@ -2,7 +2,11 @@
 
 状态：接口范围已确认，字段和参数仍待评审，尚未开始 RTL。
 
-更新日期：2026-10-20
+更新日期：2026-10-22
+
+**当前状态更新**：用户已授权设计助手决定DCache–L2剩余字段/时序细节。[项目接口约定v1](/home/ywj/yqh/docs/compact-chi-dcache-l2-interface-spec.md)已采用256-bit拍宽、64B行、256 sets/4 ways、2位alias、8位TxnID/DBID、Stash完成回应、两拍有序以及Snoop优先方案。本文下方旧的L2字段候选/待定项作为讨论历史保留，以v1为准；CPU/LSU和流水线实现问题仍单独讨论。本轮没有修改源码。
+
+七通道字段、位宽和 DCache 视角 IN/OUT 方向请以[Compact CHI DCache–L2 外部接口规格](/home/ywj/yqh/docs/compact-chi-dcache-l2-interface-spec.md)为主要评审清单。下面早期候选项不是已冻结的协议字段；特别是 last、SNP 地址和 BE 位宽须按新文档标注处理。
 
 本文件用于在定义 Chisel Bundle 和编写 RTL 之前，统一接口语义、参数候选值和未决问题。它不覆盖用户已有的工作区修改，也不代表最终实现规格。
 
@@ -322,8 +326,9 @@ tgtId
 | `DataIDBits` | 2 | 4 个 beat | 派生 |
 | `cpuDataBits` | 64 | CPU/LSU word 数据宽度 | 已确认 |
 | `chiDataBits` | 128 | L2/CHI 一拍数据宽度 | 未决 |
-| `nSets` | 待定 | 先不绑定现有 128 | 未决 |
-| `nWays` | 待定 | 先从 1-way 或 2-way 验证 | 未决 |
+| `nSets` | 256 | 用户确认 | 已确认 |
+| `nWays` | 4 | 沿用当前工程，64KiB容量 | 配套采用 |
+| `TagAlias_Width` | 2 | 4KiB页下取vaddr[13:12] | 已确认 |
 | `nMSHR` | 2 或 4 | 验证不同地址并行 | 未决 |
 | `ProbeQueueDepth` | 1 或 2 | 第一阶段同地址 Snoop | 未决 |
 | `WritebackQueueDepth` | 1 | 第一阶段暂不实现写回 | 预留 |
@@ -385,9 +390,10 @@ CPU miss
     -> 保存 returnedDbid/returnedState
     -> 关键字可提前返回 CPU
     -> 全部 DataID 收齐
-    -> 若无 pending Snoop，则允许安装
-    -> 若有 SnpToInvalid，则 discard refill
-    -> 发送 CompAck/SnpResp
+    -> 同地址 Snoop 到达时优先处理，不等待读完成或 CompAck
+    -> RXDAT/RXRSP 保持独立接收，保留原读上下文
+    -> 依据已明确的 Snoop/读顺序决定安装、转发或本地重放（细则待评审）
+    -> 分别完成读的 CompAck 与 Snoop 的响应义务
     -> CPU response 和所有协议工作完成
     -> 释放 MSHR
 ```
@@ -409,7 +415,8 @@ CPU 侧：参考 XiangShan LoadPipe；
 地址：保留 vaddr，并在需要时提供 paddr，采用 VIPT 思路；
 CPU 数据宽度：64 bit；
 第一阶段：先定义外部接口和可能事务，不先实现完整 Load miss；
-Compact CHI：第一阶段定义全部通道。
+Compact CHI：第一阶段定义全部通道；
+同地址读进行中 Snoop 优先推进，不等待 ReadShared 等读事务完成。
 ```
 
 ## 8. 仍需讨论的端口和字段问题
@@ -418,12 +425,12 @@ Compact CHI：第一阶段定义全部通道。
 
 1. CPU/LoadPipe 的 `source`、`reqId`、`pc`、`lqIdx`、kill/replay 字段保留哪些？
 2. CPU 的 `paddr` 在 LoadPipe 的哪一个阶段有效，并由谁提供给 DCache？
-3. `RXDAT` 是否同时保留原始 TxnID 和 DBID？
+3. 已核对 PDF：RXDAT 包含原始 TxnID 和返回 DBID；需确定两者实际位宽及命名空间。
 4. `CompData` 的状态和 DBID 在每一拍携带，还是只在首拍/末拍有效？
-5. `DataID` 是否固定为 beat index，是否要求 `last` 字段？
+5. PDF 已有 DataID 且无 last；需明确 DataID 到字节位置、接收拍顺序和预期 mask 的规则，内部 last 不作为标准外部字段。
 6. `TXREQ.ready` 是否确认“事务资源已完整准入”，而不是只确认入口 FIFO 有空间？当前倾向是强准入。
 7. `critical-word-first` 第一版是否启用？
-8. 同地址 Snoop 在 ReadShared 期间是否采用 `pendingSnoop + discardRefill` 策略？
+8. 已确认同地址读期间 Snoop 优先，不等待读结束；按各阶段/Snoop 类型定义响应、后续读数据使用、安装或本地重放规则，不默认一律 discardRefill。
 9. `chiDataBits`、`nSets`、`nWays`、`nMSHR`、`ProbeQueueDepth` 和 `DBIDBits` 的候选值是什么？
 10. 完整 Compact CHI 事务中，原子操作和跨层预取是否只记录为协议 TBD，还是也进入第一阶段事务矩阵？
 
