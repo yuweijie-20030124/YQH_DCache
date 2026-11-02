@@ -1,9 +1,11 @@
-// 没有 WPU。一个 bank 一次读出该 set 的 4 路，s1 再用 tag 命中选择。
-// 8 个 bank，每个 bank 一块单端口 SRAM，深度 256，数据 64 bit × 4 way。
+// 没有 WPU。一个 bank 一次读出该 set 的 4 路，s2 再用 tag 命中选择。
+// 只有 8 块单端口 SRAM，不要拆成 4 way × 8 bank = 32 个独立宏。
+// 每块深度 256，宽度 64 bit × 4 way。4 路共用这一块的地址口。
 // 两条 LoadPipe 读不同 bank 可以同拍完成。
 // 同一个 bank 且 set 不同：LQ 更老的留下，后一条 replay。
 // 同一个 bank 且 set 相同：一次读同时给两条，不 replay。
 // 写优先。MainPipe 整行读优先于 Load。
+// Load 和写或整行读撞上同一个 bank 时 replay，不在 LoadPipe 里等 ready。
 package YQH.cache
 
 import chisel3._
@@ -67,14 +69,16 @@ class BankedDataArray(implicit p: DCacheParameters) extends DCacheModule {
     val write = Flipped(DecoupledIO(new DataWriteReq))
   })
 
-  val banks = Seq.fill(DCacheBanks) {
-    Module(new SRAMTemplate(
+  val banks = Seq.tabulate(DCacheBanks) { i =>
+    val sram = Module(new SRAMTemplate(
       gen = UInt(DCacheWordBits.W),
       set = nsets,
       way = nways,
       singlePort = true,
       useBitmask = true,
     ))
+    sram.suggestName(s"dataBank_$i")
+    sram
   }
 
   val loadGo = Wire(Vec(nLoad, Bool()))
@@ -111,9 +115,10 @@ class BankedDataArray(implicit p: DCacheParameters) extends DCacheModule {
   val conflict = Wire(Vec(nLoad, Bool()))
   for (i <- 0 until nLoad) {
     val kill = io.load(i).bits.kill
-    conflict(i) := loadGo(i) && (lineBlock(i) || loadBlock(i))
+    // 写、整行读、另一条 load 都算冲突。Load 看到 conflict 就 replay。
+    conflict(i) := loadGo(i) && (writeBlock(i) || lineBlock(i) || loadBlock(i))
     io.bankConflict(i) := conflict(i)
-    io.load(i).ready := kill || (!writeBlock(i) && !lineBlock(i) && !loadBlock(i))
+    io.load(i).ready := kill || !conflict(i)
   }
   io.bankConflictSlow := RegNext(io.bankConflict)
 
@@ -163,7 +168,7 @@ class BankedDataArray(implicit p: DCacheParameters) extends DCacheModule {
     "data write must select at most one way")
   for (i <- 0 until nLoad) {
     val is128 = io.load(i).valid && PopCount(io.load(i).bits.bankMask) > 1.U
-    assert(!is128 || !loadBank0(i)(0),
-      "128-bit data read must start on an even bank")
+    assert(!is128 || loadBank0(i) =/= (DCacheBanks - 1).U,
+      "128-bit data read must not cross a cache line")
   }
 }
