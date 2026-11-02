@@ -217,7 +217,7 @@ SC消除reservation。SC即使miss也能进入MainPipe的s3，不申请MSHR。�
 + 用物理地址比 4 个 tag，并丢掉 Meta 为 I 的 way。
 + 判断写权限：UC、UD 可写，SC、I 不可写。
 + refill 先用命中 way。没有命中时，指定 way 必须已是 I；还没指定就选最小的 I way，否则只把 PLRU way 建议给 MissQueue，不在本条流水覆盖它。
-+ 需要旧数据时，向选中的 way 发 dataRead。
++ 需要旧数据时，按 bank mask 发 dataRead。每块 SRAM 吐出该 bank 的 4 路，后面只用选中的那一路。
 + 这一级不写 array，也不向 MissQueue 发请求。
 
 ### s2：分流
