@@ -16,9 +16,9 @@
 .bloop/
 .bsp/
 .idea/
-# VS Code：默认全忽略；想把共享配置（如 files.watcherExclude）提交就保留下面的放行
-.vscode/*
-!.vscode/settings.json
+# Mill 版本和编辑器配置都留在本机，不进仓库
+.mill-version
+.vscode/
 
 # ------------------------------------------------------------------ 杂项 --
 *.swp
