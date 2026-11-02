@@ -17,7 +17,7 @@ class TagReadReq(implicit p: DCacheParameters) extends DCacheBundle {
 }
 
 class TagWriteReq(implicit p: DCacheParameters) extends TagReadReq {
-  // LoadPipe 的端口还引用它。WPU 已取消，Tag SRAM 不保存这个字段。
+  // WPU 已取消，Tag SRAM 不保存这个字段。写请求类型仍留着它，避免改端口。
   val vaddr = UInt(p.vtagBits.W)
   val tag = UInt(p.tagBits.W)
 }
