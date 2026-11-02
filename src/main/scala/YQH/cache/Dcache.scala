@@ -5,6 +5,7 @@ import chisel3.stage.ChiselStage
 import chisel3.util._
 
 import YQH.{YQHBundle,YQHModule}
+import anserl2.compactchi.CompactChiRequesterIO
 
 /**
   * DCacheBundle
@@ -184,54 +185,14 @@ class LduToMissqueueForwardIO(implicit p:DCacheParameters) extends DCacheBundle{
   * L2Cache to Compact Chi
   */
 
-// TXEVT interface
-class TXEVTIO(implicit p:DCacheParameters) extends DCacheBundle{
-  
-}
-
-// TXREQ interface
-class TXREQIO(implicit p:DCacheParameters) extends DCacheBundle{
-  
-}
-
-// RXSNP interface
-class RXSNPIO(implicit p:DCacheParameters) extends DCacheBundle{
-  
-}
-
-// TXRSP interface
-class TXRSPIO(implicit p:DCacheParameters) extends DCacheBundle{
-  
-}
-
-// TXDAT interface
-class TXDATIO(implicit p:DCacheParameters) extends DCacheBundle{
-  
-}
-
-// RXRSP interface
-class RXRSPIO(implicit p:DCacheParameters) extends DCacheBundle{
-  
-}
-
-// RXDAT interface
-class RXDATIO(implicit p:DCacheParameters) extends DCacheBundle{
-  
-}
-
-// L2Cache interface
-class L2CacheIO(implicit p:DCacheParameters) extends DCacheBundle{
-  val txevt = DecoupledIO(new TXEVTIO)
-  val txreq = DecoupledIO(new TXREQIO)
-  val rxsnp = DecoupledIO(new RXSNPIO)
-  val txrsp = DecoupledIO(new TXRSPIO)
-  val txdat = DecoupledIO(new TXDATIO)
-  val rxrsp = DecoupledIO(new RXRSPIO)
-  val rxdat = DecoupledIO(new RXDATIO)
-}
+// 通道定义在 anserl2.compactchi，源码位于 /home/ywj/Compact-CHI。
+// req=TXREQ，evt=TXEVT，txRsp=TXRSP，txDat=TXDAT，rxRsp=RXRSP，rxDat=RXDAT，rxSnp=RXSNP。
+class L2CacheIO(implicit p: DCacheParameters)
+    extends CompactChiRequesterIO(p.chi, p.chiWayBits)
 
 /**
   * full DCacheIO interface
+
   */
 class DCacheIO(implicit p:DCacheParameters) extends DCacheBundle{
   val req = Input(Bool())

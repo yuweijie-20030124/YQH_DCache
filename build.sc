@@ -1,9 +1,19 @@
-import mill._, scalalib._
-import os.Path
+import mill._
+import mill.scalalib._
+import mill.api.PathRef
 
 object top extends ScalaModule {
   def scalaVersion = "2.12.18"
-  override def millSourcePath = os.pwd
+  // 固定用 build.sc 所在目录作为模块根，避免依赖进程 CWD（os.pwd）。
+  override def millSourcePath = build.millSourcePath
+  // DCache↔L2 的 Flit、宽度和 opcode 直接编译 Compact-CHI 仓库里的源码，不在 YQH 再抄一份。
+  def compactChiSources = os.Path("/home/ywj/Compact-CHI/src/main/scala")
+  override def sources = T.sources {
+    Seq(
+      PathRef(millSourcePath / "src" / "main" / "scala"),
+      PathRef(compactChiSources)
+    )
+  }
   def scalacOptions = T {
     super.scalacOptions() ++ Seq(
       "-language:reflectiveCalls",

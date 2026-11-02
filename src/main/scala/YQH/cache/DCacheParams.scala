@@ -2,6 +2,7 @@ package YQH.cache
 
 import chisel3._
 import chisel3.util._
+import anserl2.compactchi.{CompactChiParams, CompactChiUpstreamNodeId}
 
 /*
  * DCache 参数配置
@@ -15,29 +16,60 @@ case class DCacheParameters(
     nWays       :Int = 4     ,
     blockBytes  :Int = 64    ,
     rowBits     :Int = 64    ,
-    nMissEntries:Int = 8     ,
+    nMissEntries:Int = 16    ,
+    nProbeEntries:Int = 16   ,
+    nReleaseEntries:Int = 18 ,
 
-    //dcache大小 = 256set * 4 way * 512bit = 64kb
+    // dcache大小 = 256 set * 4 way * 64 B = 64 KB
 
-    //bank
+    // bank
     nBanks       :Int = 8    ,
-    // tag
-    tagBits     :Int = 48-13 ,
-    vtagBits    :Int = 48-12 ,
+    // 物理 tag 是 paddr[47:12]，36 bit。必须带上 paddr[13:12]：
+    // set index 的高两位是虚拟别名，不是物理地址。若只存 paddr[47:14]，
+    // 同 set 内仅 [13:12] 不同的两行会得到相同 tag。
+    // vtagBits 只留给已停用的 WPU，当前不参与命中判断。
+    tagBits     :Int = 48-12 ,
+    vtagBits    :Int = 48-14 ,
 
-    //loadpipe个数。
-    LoadPipelineWidth:Int = 3,
+    // LoadPipe 个数。上游接口定为 2。
+    LoadPipelineWidth:Int = 2,
 
-    // MSHR
+    // 第一版关闭。干净 victim 只发 Evict，不发 WriteEvictFull。
+    alwaysReleaseData:Boolean = false,
 
+    // 上游节点号用 Compact-CHI 的单核编号。DCache = 2。
+    // Compact-CHI 没有下游节点号常量，L2 仍暂用 0。
+    dcacheNodeId:Int = CompactChiUpstreamNodeId.DCache,
+    l2NodeId:Int = 0,
+
+    // L1↔L2 的字段宽度用 Compact-CHI 的 CompactChiParams。
+    // tagAliasBits 不跟库的默认 1。256 set 的 index 含 vaddr[13:12]，必须是 2。
+    chi: CompactChiParams = CompactChiParams(tagAliasBits = 2),
 
     //OUTSIDE (SoC / Core设置)
     PAddrBits   :Int  = 48  ,
     VAddrBits   :Int  = 48  ,
     XLEN        :Int  = 64  ,
     reqIdWidth  :Int  = 5,
-    
-)
+
+) {
+  // way 位宽不在 CompactChiParams 里。库的约定是按路数传入索引宽度：八路为 3，四路为 2。
+  val chiWayBits: Int = log2Ceil(nWays)
+
+  require(nSets == 256 && nWays == 4 && blockBytes == 64 && nBanks == 8)
+  require(rowBits == 64)
+  require(nMissEntries == 16 && nProbeEntries == 16 && nReleaseEntries == 18)
+  require(nReleaseEntries > nMissEntries)
+  require(LoadPipelineWidth == 2)
+  require(!alwaysReleaseData)
+  require(PAddrBits == 48 && tagBits == PAddrBits - 12)
+  require(dcacheNodeId == CompactChiUpstreamNodeId.DCache && l2NodeId >= 0)
+  require(chi.addrBits == PAddrBits)
+  require(chi.dataBits == 256 && chi.dataBytes * 2 == blockBytes)
+  require(chi.snoopAddrBits == PAddrBits - 3)
+  require(chi.tagAliasBits == 2)
+  require(chiWayBits == 2 && (1 << chiWayBits) == nWays)
+}
 
 /*
  * Dcache的特性
@@ -57,17 +89,32 @@ trait HasDCacheParameters{
   def DCACHE_PREFETCH_SOURCE = 3
   def SOFT_PREFETCH = 4
 
-  // cacheline help
-  def idxBits = log2Up(p.nSets)
-  
   // val赋值
   val nsets         = p.nSets
   val nways         = p.nWays
   val blockBytes    = p.blockBytes
   val blockOffBits  = log2Up(blockBytes)
+
+  // cacheline / tag 地址划分
+  def idxBits = log2Up(p.nSets)
+  def untagBits = blockOffBits + idxBits
+  // 与 XiangShan 的 HasL1CacheParameters 一致：4 KiB 页内地址不参与物理 tag。
+  def pgIdxBits = 12
+  def pgUntagBits = untagBits min pgIdxBits
   val nMissEntries  = p.nMissEntries
+  val nProbeEntries = p.nProbeEntries
+  val nReleaseEntries = p.nReleaseEntries
+  val loadPipelineWidth = p.LoadPipelineWidth
+  val alwaysReleaseData = p.alwaysReleaseData
   val reqIdWidth    = 6 //Dcache请求/响应的id字段位宽 暂时不知道多少,我先填一个6
   val tagBits       = p.tagBits
+  // txnId：0～15 是 MSHR，16 是 CMO，17～34 是 WritebackQueue。
+  def cmoTxnIdInt: Int = nMissEntries
+  def wbTxnIdBaseInt: Int = nMissEntries + 1
+  def wbTxnIdInt(entry: Int): Int = {
+    require(entry >= 0 && entry < nReleaseEntries)
+    wbTxnIdBaseInt + entry
+  }
   // banked dcache support
   def DCacheSets     = p.nSets        // 不再硬编码
   def DCacheWordBits = p.rowBits      // 一个 bank 一次读写的数据位宽
@@ -81,7 +128,7 @@ trait HasDCacheParameters{
   val DCacheBankOffset = log2Ceil(DCacheWordBytes)
   val DCacheSetBits    = log2Ceil(DCacheSets)
   val DCacheSetOffset  = DCacheBankOffset + DCacheBankBits + DCacheSetBits
-
+  val DCacheAboveIndexOffset = DCacheSetOffset + log2Up(nsets)
 
   require(DCacheWordBits % 8 == 0)
   require(DCacheBanks > 0 && (1 << DCacheBankBits) == DCacheBanks)
@@ -121,19 +168,93 @@ trait HasDCacheParameters{
   // idx 的低位紧接在 bank 位之后，高位由 set 位宽决定。
   // 当前配置下等价于 addr(13, 6)，结果宽度为 DCacheSetBits = 8 bit。
   def get_idx(addr: UInt): UInt = {
-    val idxLo = DCacheBankOffset + DCacheBankBits
-    val idxHi = idxLo + DCacheSetBits - 1
-    require(addr.getWidth >= idxHi + 1)
-    addr(idxHi, idxLo)
+    require(addr.getWidth >= untagBits)
+    addr(untagBits - 1, blockOffBits)
   }
 
-  // 从物理地址中提取与 TagArray 宽度一致的 tag。
-  def get_tag(addr: UInt): UInt = {
+  // 物理 tag 的切分方式与 XiangShan 一致：paddr >> pgUntagBits。
+  // 当前配置等价于 paddr(47, 12)，宽度为 tagBits = 36。
+  def get_phy_tag(addr: UInt): UInt = {
     require(addr.getWidth >= PAddrBits)
-    addr(PAddrBits - 1, PAddrBits - tagBits)
+    addr(PAddrBits - 1, pgUntagBits)
   }
 
+  def chi = p.chi
+  def chiWayBits = p.chiWayBits
 
+  // 只有 SNP 地址是 paddr[47:3]。REQ 和 EVT 在 Compact-CHI 里都是完整的 48 bit。
+  def chiSnoopAddr(byteAddr: UInt): UInt = {
+    require(byteAddr.getWidth >= PAddrBits)
+    byteAddr(PAddrBits - 1, 3)
+  }
+
+  def chiByteAddr(snoopAddr: UInt): UInt = {
+    require(snoopAddr.getWidth >= chi.snoopAddrBits)
+    Cat(snoopAddr(chi.snoopAddrBits - 1, 0), 0.U(3.W))
+  }
+
+  // 线上还原 set：{tagAlias, addr[11:6]}。tagAlias 固定 2 bit，结果是 8 bit，对应 256 set。
+  def dcacheSet(tagAlias: UInt, byteAddr: UInt): UInt = {
+    val aliasBits = chi.tagAliasBits
+    require(byteAddr.getWidth >= 12 && tagAlias.getWidth >= aliasBits)
+    if (aliasBits == 0) byteAddr(11, 6)
+    else Cat(tagAlias(aliasBits - 1, 0), byteAddr(11, 6))
+  }
+
+  def get_tag(addr: UInt): UInt = get_phy_tag(addr)
+
+  def get_direct_map_way(addr:UInt): UInt = {
+    addr(DCacheAboveIndexOffset + log2Up(nways) - 1, DCacheAboveIndexOffset)
+  }
+
+  //时序优化 二叉树并行or
+object ParallelOperation {
+  def apply[T](xs: Seq[T], func: (T, T) => T): T = {
+    require(xs.nonEmpty)
+    xs match {
+      case Seq(a) => a
+      case Seq(a, b) => func(a, b)
+      case _ =>
+        apply(Seq(apply(xs take xs.size/2, func), apply(xs drop xs.size/2, func)), func)
+    }
+  }
+}
+
+object ParallelMux {
+  def apply[T<:Data](in: Seq[(Bool, T)]): T = {
+    val xs = in map { case (cond, x) => Mux(cond, x, 0.U.asTypeOf(x)) }
+    ParallelOR(xs)
+  }
+  def apply[T <: Data](sel: Seq[Bool], in: Seq[T]): T = apply(sel.zip(in))
+}
+
+object ParallelPriorityMux {
+  def apply[T <: Data](in: Seq[(Bool, T)]): T = {
+    ParallelOperation(in, (a: (Bool, T), b: (Bool, T)) => (a._1 || b._1, Mux(a._1, a._2, b._2)))._2
+  }
+  def apply[T <: Data](sel: Bits, in: Seq[T]): T = apply((0 until in.size).map(sel(_)), in)
+  def apply[T <: Data](sel: Seq[Bool], in: Seq[T]): T = apply(sel zip in)
+}
+
+object ParallelOR {
+  def apply[T <: Data](xs: Seq[T]): T = {
+    ParallelOperation(xs, (a: T, b: T) => (a.asUInt | b.asUInt).asTypeOf(xs.head))
+  }
+}
+
+object ParallelORR {
+  def apply(in: Seq[Bool]): Bool = ParallelOR(in)
+  def apply(in: Bits): Bool = apply(in.asBools)
+}
+
+}
+
+object MetaState {
+  // L1 本地 Meta，2 bit。没有 SD。CHI Resp 是另一套 3 bit 编码，不能混用。
+  def I  = 0.U(2.W)
+  def SC = 1.U(2.W)
+  def UC = 2.U(2.W)
+  def UD = 3.U(2.W)
 }
 
 trait MemoryOpConstants {
