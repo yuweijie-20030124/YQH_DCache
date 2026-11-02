@@ -17,59 +17,61 @@ DCache 中会碰到的冲突，导致的延迟挺严重的。
 10. 别名 conflict
 11. way 占用 conflict
 
-读写端口冲突的本质是没有那么多读写口。SRAM 做成真多口，时序和面积都会变差；冲突太多，性能又会掉。中间的取舍一般是三种做法：真多端口、复制多份、按 bank 拆开。YQH 的 Data 按 way 和 bank 拆开，Tag 用复制体，Meta 用寄存器（Meta就两位，寄存器开销不高）。Data Array用拆分Bank的方式来达成伪多读写端口的目的。
+读写端口冲突的本质是没有那么多读写口。SRAM 做成真多口，时序和面积都会变差；冲突太多，性能又会掉。中间的取舍一般是三种做法：真多端口、复制多份、按 bank 拆开。YQH 的 Data 只按 bank 拆开，不按 way 再拆宏。Tag 用复制体，Meta 用寄存器（Meta 就两位，寄存器开销不高）。
 
 # ① DataArray bank conflict
 <img src="https://cdn.nlark.com/yuque/0/2026/png/35409901/1793091204651-f658f0c4-b36f-4fcd-897e-edfd4dbcf03a.png" width="398" title="" crop="0,0,1,1" id="ufddad4bc" class="ne-image">
 
-目前的YQH设计是不打算带路预测的。
+目前的 YQH 设计不带路预测。
 
+Data 是 256 set、4 way、64 B 行、8 个 bank，每个 bank 64 bit。物理上只有 8 块单端口 SRAM，不是 4 × 8 = 32 个宏。
 
+每一块对应一个 bank：深度 256，宽度是 4 路 × 64 bit = 256 bit。一个地址读出来，这个 set 里该 bank 的 4 路一起出来。写的时候用 4 bit way 掩码，只改选中的那一路，但地址口仍然被整块 SRAM 占住。4 路没有各自的地址口，所以不能“只打开命中的那一路、另一路照读”。
 
-Data 是 256 set、4 way、64 B 行、8 个 bank，每个 bank 64 bit。物理组织和香山打开 WPU 时一样：每一路的每一个 bank 各有一块单口 SRAM。一共 4 × 8 = 32 块，深度 256，宽度 64 bit。way 不是同一块 SRAM 里的宽度。
+不复制三份。两条 LoadPipe 和 MainPipe 共用这 8 块。不同 bank 可以同拍访问；同一个 bank 只有一个地址口。
 
-不使用 WPU。路预测的成功率不够，测错了还要 replay，读错的那一路 SRAM 白耗了，请求还要重来。
+不使用 WPU。路预测的成功率不够，测错了还要 replay。没有 WPU 时，s0 还不知道命中 way，Data 又要在 s1 发出读。因此做成香山不开 WPU 的读法：碰到哪个 bank，就把该 bank 的 4 路一起读出来，s2 再用 tag 比较结果挑选。代价是每次打开的位宽是 256 bit，不是 64 bit。换来的是宏的数量从 32 降到 8。
 
-也不能做成“s0 先拿到正确 way，再打开一块 SRAM”。s0 是地址刚进来的那一拍，这一拍只能把 set index 送给 Tag SRAM。Tag 要到下一拍才输出，物理 tag 比较也在 s1。正确 way 是比较出来的，s0 时还不存在。香山的 WPU 能在 s0 读 Data，是因为它猜了一个 way，不是因为它已经知道正确 way。
+s0 只根据虚拟地址读这个 set 的 4 路 Tag 和 4 路 Meta。Data 这一拍不碰。
 
-已冻结为串行 DCache，不加 WPU。s1 比较出唯一的真实 way 之后，才给这一路的目标 bank 发读。Data SRAM 再过一拍，s2 才能把数据和 hit/miss 一起返回。命中数据比“s0 把 4 路一起读出来”晚一拍，这拍延迟用来换功耗：平时只打开 1 到 2 块 Data SRAM。
+s1 拿到 Tag、Meta 和物理地址，比较出唯一的真实 way。普通 load 命中才读 Data。读的时候 `way_en` 全 1，SRAM 仍吐出 4 路；命中 way 留到 s2 再选。64 bit 打开 1 块，128 bit 打开 `bank` 和 `bank + 1` 两块。跨 cache line 由 LSU 拆开，不会从 bank 7 绕回 bank 0。miss、权限升级和软件预取不读 Data。
 
-s0 只根据虚拟地址读这个 set 的 4 路 Tag 和 4 路 Meta。Tag 很小，4 路一起读可以接受。Data 这一拍不碰。
+probe、原子、部分 store 要旧数据时，也是按 bank mask 读这 8 块里被碰到的那些。每块仍吐出 4 路，流水线只用已经选定的那一路。replace 的 way 是 victim，probe 和原子的 way 来自 Tag 比较。整行最多打开全部 8 块。
 
-s1 拿到 Tag、Meta 和物理地址，比较出唯一的真实 way。然后只打开这一路里地址落到的那一块 bank SRAM。128 bit 也只读这一路的 `bank` 和 `bank + 1`。跨 cache line 由 LSU 拆开，不会从 bank 7 绕回 bank 0。比较结果是 miss 时，不读 Data。
+冲突只看 bank 和 set，不再看 way。way 不同也是同一块 SRAM。
 
-probe、replace、原子要旧数据时同样先确定 way，再只读这一路的 8 个 bank。replace 的 way 是已经选定的 victim。probe 和原子的 way 来自 Tag 比较，不是预测。
++ 同一个 bank、set 不同：冲突。这块 SRAM 只有一个地址口。
++ 同一个 bank、set 相同：一次读同时给两边，不冲突。
++ bank 不同：两块 SRAM，并行，不冲突。
 
-所以一次 Data 访问只打开 1 块 SRAM，128 bit 打开 2 块，整行打开这一路的 8 块。不会为了保险把 4 路一起读出来。
-
-冲突要同时满足三件：同一个 bank、同一个 way、不同的 set。way 不同就是不同的 SRAM，set 即使相同也不冲突。同一 set、同一 way、同一 bank 可以共用一次读，因为地址相同。
-
-写被本拍收下之后，下一拍才占用 SRAM。写读冲突看的是上一拍写下的那一路，不是所有路。
+写在本拍就占住被写的 bank。不是“下一拍才占用”。写掩码碰到哪个 bank，这个 bank 的 4 路本拍都不能读。
 
 ## 读读冲突
-两条 load 在 s1 要读同一块 SRAM：way 相同、bank 有重叠、set 不同。这块 SRAM 只有一个地址口。
+两条 load 在 s1 要读同一个 bank，而且 set 不同。和 way 无关：一个要 way 0、一个要 way 1，只要 bank 重叠，仍然是同一块 SRAM。
 
-处理：用 LoadQueue 的年龄选出最老的那条。年轻的返回 replay。128 bit 只要两个 bank 里有一个重叠，并且 way 相同，就算冲突。way 不同，两路并行读，不 replay。
+处理：用 LoadQueue 的年龄选出最老的那条。年轻的返回 replay，LoadPipe 不停下来等 ready。128 bit 只要两个 bank 里有一个重叠就算冲突。bank 完全错开则两路并行，不 replay。
 
 ## 读读行冲突
-整行读已经知道 way，要占住这一路的 8 个 bank。一条 load 也要读这一路，而且 set 不同，就和整行读冲突。
+整行读要占住 mask 里的那些 bank，最多 8 块。一条 load 的 bank 和它有重叠，而且 set 不同，就冲突。
 
-整行读优先。load 返回 replay。load 如果是另一路，整行读挡不住它。同一 set、同一 way 可以共用这次整行读。
+整行读优先。load 返回 replay。同一 set 可以共用这次整行读，因为地址相同。不能再按“load 在另一路就放行”，4 路在同一块 SRAM 里。
 
 ## 写读冲突
-上一拍写的是某一路的若干 bank。这一拍 load 只有 way 相同，而且要读的 bank 和写 mask 重叠，才被挡住。
+本拍写的 bank 和 load 要读的 bank 有重叠。way 相同与否都不影响。
 
-处理：挡住这一路的这个读口，load 返回 replay。只写了 way 0 的 bank 2 时，读 way 0 的 bank 0 不用让，读 way 1 的任何 bank 也不用让。
+处理：load 返回 replay。只写了 bank 2 时，读 bank 0 不用让；读 bank 2 的任何 way 都要让。写进 SRAM 时仍然只用 way 掩码改那一路，另外 3 路的数据不动，只是这一拍读不出来。
 
 ## 写读行冲突
-上一拍写过某一路的任意 bank，这一拍又要读这一路的整行。整行需要这一路的 8 个 bank，所以只要这一路还有写没结束，整行读就不能开始。
+本拍写过的任意 bank 落在整行读的 mask 里，整行读就不能开始。
 
-处理：这一路整行读的 ready 为 0，probe、replace 或原子读停在原地，不向 LSU 报 replay。写的是别的 way 时，不挡。
+处理：整行读的 ready 为 0。probe、原子这些读停在原地，不向 LSU 报 replay。写的是 mask 以外的 bank 时，不挡。
 
 ## 写写冲突
-Data 的写只有 MainPipe s3。不再有第二条回填流水和它同时写。同一拍、同一路、同一个 bank 仍然只有一个写地址。部分 store 只写选定 way 上被 mask 碰到的 bank，不写别的 way，也不写这一路没碰到的 bank。
+Data 的写只有 MainPipe s3。不再有第二条回填流水和它同时写。同一拍、同一个 bank 只有一个写地址。
 
-Store 进 MainPipe 之后，旧数据也只读这一路里“被写到、但没有整 bank 覆盖”的那些 bank。
+部分 store 只写 mask 碰到的 bank，并在这一块 256 bit 里用 way 掩码改选中的那 64 bit。没碰到的 bank 不写。碰到的 bank 里，另外 3 路不改，但本拍也不能被别人读。
+
+Store 要旧数据时，只读“被写到、但没有整 bank 覆盖”的那些 bank。读出来的是 4 路，合并时只用选中的那一路。
 
 # ② MainPipe set conflict
 这是流水线里的结构冲突，不是“Snoop 必须等 ReadShared”。

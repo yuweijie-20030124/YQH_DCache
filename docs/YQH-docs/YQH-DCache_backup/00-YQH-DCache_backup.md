@@ -155,7 +155,7 @@ DCache不负责NC访存，需要走另一个通道，由上游进行分辨内存
 #### DataArray
 由sram实现
 
-分256set，8bank，4way，一个bank 64bit。DataArray中会例化出32个SRAM宏
+分256set，8bank，4way，一个bank 64bit。DataArray只例化8块单端口SRAM，不拆成32个宏。每块深度256，宽度是4路×64bit。一次读出该bank的全部4路，写用way掩码只改其中一路。两条LoadPipe和MainPipe共用这8块，不复制。不同bank可同拍访问，同一bank只有一个地址口。
 
 <img src="https://cdn.nlark.com/yuque/0/2026/png/35409901/1793171891039-77840c45-3091-4135-b9ad-fde87499e718.png" width="702" title="" crop="0,0,1,1" id="u56e8587d" class="ne-image">
 
