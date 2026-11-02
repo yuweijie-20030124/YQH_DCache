@@ -31,7 +31,7 @@ class MetaData(implicit p: DCacheParameters) extends DCacheBundle {
 }
 
 // read(0)、read(1) 给两条 LoadPipe，read(2) 给 MainPipe。
-// 读口永远 ready。写和读撞上同一个 set 时，这一拍读到的仍是旧值。
+// 读口永远 ready。同一个 set 在写的这一拍，读口打进寄存器的是新值。
 class MetaArray(implicit p: DCacheParameters) extends DCacheModule {
   val nReadPorts = loadPipelineWidth + 1
 
@@ -58,9 +58,16 @@ class MetaArray(implicit p: DCacheParameters) extends DCacheModule {
   for (i <- 0 until nReadPorts) {
     val req = io.read(i)
     req.ready := true.B
-    // 在写生效前把当前值打进寄存器，避免同拍写被这一拍的读提前看见。
+    // 同 set 同拍写要 forward。读仍打一拍，下一拍看到的是新 Meta。
     val readData = Wire(Vec(nways, new MetaData))
     readData := meta(req.bits.idx)
+    when(io.write.fire && io.write.bits.idx === req.bits.idx) {
+      for (w <- 0 until nways) {
+        when(io.write.bits.way_en(w)) {
+          readData(w) := io.write.bits.meta
+        }
+      }
+    }
     io.resp(i) := RegEnable(readData, req.fire)
     io.respValid(i) := RegNext(req.fire, false.B)
   }
