@@ -121,7 +121,7 @@ class DCacheLoadIO(implicit p: DCacheParameters) extends DCacheWordIO
   val s1_pc             = Output(UInt(VAddrBits.W))
   val s2_pc             = Output(UInt(VAddrBits.W))
   val replacementUpdated = Output(Bool())
-  val is128Req = Bool()
+  val is128Req = Output(Bool())
   val s1_paddr_dup_lsu = Output(UInt(PAddrBits.W)) 
   val s1_paddr_dup_dcache = Output(UInt(PAddrBits.W)) 
   val s1_disable_fast_wakeup = Input(Bool())
@@ -155,101 +155,198 @@ class DCacheStoreIO(implicit p:DCacheParameters) extends DCacheBundle{
 }
 
 // storebuffer to DCache interface for store(date + address)
+// hit 和 replay 都要握手。对端没接住，MainPipe 或 MissQueue 就不离开当前项。
 class DCacheToSbufferIO(implicit p:DCacheParameters) extends DCacheBundle{
-  // sbuffer will directly send request to dcache main pipe
-  val req = Flipped(Decoupled(new DCacheLineReq))
+  val req = Flipped(DecoupledIO(new DCacheLineReq))
 
-  val main_pipe_hit_resp = ValidIO(new DCacheLineResp)
-  //val refill_hit_resp = ValidIO(new DCacheLineResp)
+  // 命中写在 MainPipe s3 完成。
+  val main_pipe_hit_resp = DecoupledIO(new DCacheLineResp)
+  // miss 的 store 要等 refill 安装或放弃之后，由 MissQueue 逐个客户送出。
+  val refill_hit_resp = DecoupledIO(new DCacheLineResp)
+  // MainPipe s2 的 replay 和 MissQueue 放弃安装的 replay 合成这一条。s2 优先。
+  val replay_resp = DecoupledIO(new DCacheLineResp)
 
-  val replay_resp = ValidIO(new DCacheLineResp)
-
-  //def hit_resps: Seq[ValidIO[DCacheLineResp]] = Seq(main_pipe_hit_resp, refill_hit_resp)
-  def hit_resps: Seq[ValidIO[DCacheLineResp]] = Seq(main_pipe_hit_resp)
+  def hit_resps: Seq[DecoupledIO[DCacheLineResp]] = Seq(main_pipe_hit_resp, refill_hit_resp)
 }
 
-// atomics interface for atomicunit 
+// LR、SC、AMO、AMOCAS。req 用 MainPipeReq，probe 相关字段保持 0。
+// resp 是做完的旧值；replay 是没做成，AtomicsUnit 以后重发。
 class AtomicWordIO(implicit p:DCacheParameters) extends DCacheBundle{
-
+  val req = Flipped(DecoupledIO(new MainPipeReq))
+  val resp = DecoupledIO(new MainPipeAtomicResp)
+  val replay = DecoupledIO(new DCacheLineResp)
 }
-
-// L2Cache Data channel forward to LSU
-class DcacheToLduForwardIO(implicit p:DCacheParameters) extends DCacheBundle{
-
-}
-
-// MSHR forward to LSU
-class LduToMissqueueForwardIO(implicit p:DCacheParameters) extends DCacheBundle{
-
-}
-
-// 
-
-// 
-
-/**
-  * L2Cache to Compact Chi
-  */
 
 // 通道定义在 anserl2.compactchi，源码位于 /home/ywj/Compact-CHI。
 // req=TXREQ，evt=TXEVT，txRsp=TXRSP，txDat=TXDAT，rxRsp=RXRSP，rxDat=RXDAT，rxSnp=RXSNP。
 class L2CacheIO(implicit p: DCacheParameters)
     extends CompactChiRequesterIO(p.chi, p.chiWayBits)
 
+class DCacheWfi(implicit p:DCacheParameters) extends DCacheBundle{
+  val req = Input(Bool())
+  val safe = Output(Bool())
+}
+
 /**
   * full DCacheIO interface
-
+  * load 的方向和 LoadPipe 内部的 lsu 一致：DCache 接收请求，送出响应。
   */
 class DCacheIO(implicit p:DCacheParameters) extends DCacheBundle{
-  val req = Input(Bool())
-  val write = Input(Bool())
-  val addr = Input(UInt(32.W))
-  val wdata = Input(UInt(32.W))
-  val ready = Output(Bool())
-  val rdata = Output(UInt(32.W))
-  val memReq = Output(Bool())
-  val memWrite = Output(Bool())
-  val memAddr = Output(UInt(32.W))
-  val memWdata = Output(UInt(32.W))
-  val memReady = Input(Bool())
-  val memRdata = Input(UInt(32.W))
-}
-/**
-  * DCacheBundle 
-  */
+  val load = Vec(loadPipelineWidth, Flipped(new DCacheLoadIO))
+  val store = new DCacheToSbufferIO
+  val atomics = new AtomicWordIO
+  val cmoReq = Flipped(DecoupledIO(new CmoReq))
+  val cmoResp = DecoupledIO(new CmoResp)
+  val wfi = new DCacheWfi
+  val l2 = new L2CacheIO
 
-class DCache(implicit p:DCacheParameters) extends Module {
+  // RXDAT 当拍的半行。LSU 没接到也没关系，数据还在 MSHR 里。
+  val forwardChi = Output(Valid(new MissForwardBeat))
+  val forwardMshr = new MissForwardRead
+  val refillWakeup = DecoupledIO(new MissNotify)
+  val loadReplay = DecoupledIO(new MissNotify)
+}
+
+class DCache(implicit p:DCacheParameters) extends DCacheModule {
   val io = IO(new DCacheIO)
 
-  // Sixteen one-word lines; the caller supplies word-aligned addresses.
-  val valid = RegInit(VecInit(Seq.fill(16)(false.B)))
-  val tags = Reg(Vec(16, UInt(26.W)))
-  val data = Reg(Vec(16, UInt(32.W)))
+  val tags = Module(new DuplicatedTagArray)
+  val meta = Module(new MetaArray)
+  val data = Module(new BankedDataArray)
+  val loads = Seq.tabulate(loadPipelineWidth)(i => Module(new LoadPipe(i)))
+  val pipe = Module(new MainPipe)
+  val miss = Module(new MissQueue)
+  val arb = Module(new MissArb)
+  val wb = Module(new WriteBackQueue)
+  val probe = Module(new ProbeQueue)
 
-  val index = io.addr(5, 2)
-  val tag = io.addr(31, 6)
-  val hit = valid(index) && tags(index) === tag
-
-  // A read hit completes locally; misses and all writes wait for memory.
-  io.memReq := io.req && (io.write || !hit)
-  io.memWrite := io.req && io.write
-  io.memAddr := io.addr
-  io.memWdata := io.wdata
-  io.ready := io.req && Mux(io.write || !hit, io.memReady, true.B)
-  io.rdata := Mux(hit, data(index), io.memRdata)
-
-  when(io.ready) {
-    when(io.write) {
-      // Write-through, without allocating a line on a write miss.
-      when(hit) { data(index) := io.wdata }
-    }.elsewhen(!hit) {
-      valid(index) := true.B
-      tags(index) := tag
-      data(index) := io.memRdata
-    }
+  for (i <- 0 until loadPipelineWidth) {
+    val ld = loads(i).io
+    ld.lsu <> io.load(i)
+    tags.io.read(i) <> ld.tag_read
+    meta.io.read(i) <> ld.meta_read
+    ld.tag_resp := tags.io.resp(i)
+    ld.meta_resp := meta.io.resp(i)
+    data.io.load(i) <> ld.banked_data_read
+    ld.banked_data_resp := data.io.loadResp(i)
+    ld.bank_conflict := data.io.bankConflict(i)
+    ld.disable_ld_fast_wakeup := false.B
+    ld.unique_occupy_fail := miss.io.occupyFail(i)
+    miss.io.occupySet(i).valid := ld.unique_occupy_valid
+    miss.io.occupySet(i).bits := ld.unique_occupy_set
+    wb.io.blockQuery(i) := ld.wbq_conflict_check
+    ld.wbq_block_miss_req := wb.io.block(i)
+    pipe.io.replaceAccess(i) := ld.replace_access
+    ld.miss_resp := miss.io.missResp
   }
-}
 
+  val mp = pipe.io
+  tags.io.read(loadPipelineWidth) <> mp.tagRead
+  meta.io.read(loadPipelineWidth) <> mp.metaRead
+  mp.tagResp := tags.io.resp(loadPipelineWidth)
+  mp.metaResp := meta.io.resp(loadPipelineWidth)
+  tags.io.write <> mp.tagWrite
+  meta.io.write <> mp.metaWrite
+  data.io.line <> mp.dataRead
+  mp.dataResp := data.io.lineResp
+  data.io.write <> mp.dataWrite
+
+  arb.io.in(0) <> mp.missReq
+  arb.io.in(1) <> loads(0).io.miss_req
+  arb.io.in(2) <> loads(1).io.miss_req
+  miss.io.missReq <> arb.io.out
+  // MainPipe 是仲裁口 0，发出去的那拍 missResp 一定是它自己的。
+  mp.missResp := miss.io.missResp
+  // 两条 Load 在自己的口里已经挡住 WritebackQueue。这里不再挡一次。
+  miss.io.wbBlock := false.B
+
+  mp.refill <> miss.io.refill
+  mp.refillInfo := miss.io.refillInfo
+  miss.io.mainpipeInfo := mp.mainpipeInfo
+  miss.io.pendingQuery := mp.pendingSnoop
+  mp.pendingInvalidate := miss.io.pendingInvalidate
+  miss.io.snoop := mp.snoopNotice
+  miss.io.bufferTake.valid := false.B
+  miss.io.bufferTake.bits := 0.U
+  miss.io.l2Hint.valid := false.B
+  miss.io.l2Hint.bits := 0.U.asTypeOf(new MissHint)
+
+  miss.io.occupySet(2) := mp.occupySet
+  mp.occupyWay := miss.io.occupyWay(2)
+  mp.occupyFail := miss.io.occupyFail(2)
+  miss.io.replaceQuery := mp.replaceQuery
+  mp.replaceBlock := miss.io.replaceBlock
+
+  wb.io.req <> mp.wbReq
+  wb.io.blockQuery(2) := mp.wbQuery
+  mp.wbBlock := wb.io.block(2)
+  wb.io.blockQuery(3) := miss.io.cmoQuery
+  miss.io.cmoWbBlock := wb.io.block(3)
+
+  probe.io.pipeReq <> mp.probe
+  probe.io.probeResp <> mp.probeResp
+  probe.io.lrscLockedBlock := mp.lrsc_blocked_block
+  probe.io.updateResvSet := mp.update_resv_set
+  // 同地址 Probe 走到 s3 时，MainPipe 自己清 reservation。
+  mp.invalid_resv_set := false.B
+
+  mp.store <> io.store.req
+  io.store.main_pipe_hit_resp <> mp.storeHit
+  io.store.refill_hit_resp <> miss.io.storeDone
+  val replay = io.store.replay_resp
+  replay.valid := mp.storeReplay.valid || miss.io.storeReplay.valid
+  replay.bits := Mux(mp.storeReplay.valid, mp.storeReplay.bits, miss.io.storeReplay.bits)
+  mp.storeReplay.ready := replay.ready
+  miss.io.storeReplay.ready := replay.ready && !mp.storeReplay.valid
+
+  mp.atomic <> io.atomics.req
+  io.atomics.resp <> mp.atomicResp
+  io.atomics.replay <> mp.atomicReplay
+
+  miss.io.cmoReq <> io.cmoReq
+  io.cmoResp <> miss.io.cmoResp
+  io.forwardChi := miss.io.forwardChi
+  io.forwardMshr <> miss.io.forwardMshr
+  io.refillWakeup <> miss.io.refillWakeup
+  io.loadReplay <> miss.io.loadReplay
+
+  // txnId：0～15 MSHR，16 CMO，17～34 WritebackQueue。没有 Credit。
+  io.l2.req <> miss.io.txReq
+  io.l2.evt <> wb.io.txEvt
+  io.l2.txDat <> wb.io.txDat
+  io.l2.rxDat <> miss.io.rxDat
+  io.l2.rxSnp <> probe.io.rxSnp
+
+  val rspId = io.l2.rxRsp.bits.txnID
+  val rspToMiss = rspId <= cmoTxnIdInt.U
+  val rspToWb = rspId >= wbTxnIdBaseInt.U && rspId < (wbTxnIdBaseInt + nReleaseEntries).U
+  miss.io.rxRsp.valid := io.l2.rxRsp.valid && rspToMiss
+  miss.io.rxRsp.bits := io.l2.rxRsp.bits
+  wb.io.rxRsp.valid := io.l2.rxRsp.valid && rspToWb
+  wb.io.rxRsp.bits := io.l2.rxRsp.bits
+  io.l2.rxRsp.ready := Mux(rspToWb, wb.io.rxRsp.ready, Mux(rspToMiss, miss.io.rxRsp.ready, false.B))
+
+  // Snoop 的无数据应答先走。CompAck 晚一拍不影响正确性，Snoop 堵住会拖住 L2。
+  val snpRsp = wb.io.txRsp
+  val ackRsp = miss.io.txRsp
+  io.l2.txRsp.valid := snpRsp.valid || ackRsp.valid
+  io.l2.txRsp.bits := Mux(snpRsp.valid, snpRsp.bits, ackRsp.bits)
+  snpRsp.ready := io.l2.txRsp.ready
+  ackRsp.ready := io.l2.txRsp.ready && !snpRsp.valid
+
+  miss.io.wfi.req := io.wfi.req
+  wb.io.wfi.req := io.wfi.req
+  probe.io.wfi.req := io.wfi.req
+  val loadBusy = loads.map(_.io.busy).reduce(_ || _)
+  io.wfi.safe := miss.io.wfi.safe && wb.io.wfi.safe && probe.io.wfi.safe && !mp.busy && !loadBusy
+
+  assert(!io.l2.rxRsp.valid || rspToMiss || rspToWb,
+    "RXRSP txnId is not a miss, CMO, or writeback id")
+  assert(!io.l2.rxDat.fire || io.l2.rxDat.bits.txnID < nMissEntries.U,
+    "RXDAT txnId must be an MSHR")
+  assert(PopCount(Seq(snpRsp.fire, ackRsp.fire)) <= 1.U,
+    "TXRSP sends one response per cycle")
+}
 
 object topMain extends App {
   // DCache 的构造参数是 implicit 的，emit 前必须在这里给一个具体配置

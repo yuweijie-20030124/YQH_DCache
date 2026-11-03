@@ -33,8 +33,11 @@ class LoadPipeIO(implicit p: DCacheParameters) extends DCacheBundle {
   val replace_access = ValidIO(new ReplacementAccessBundle)
 
   val disable_ld_fast_wakeup = Input(Bool())
+  // 只有权限升级才占 set。普通 load 的下标无效，不能拿去问 MissQueue。
+  val unique_occupy_valid = Output(Bool())
   val unique_occupy_set = Output(UInt(idxBits.W))
   val unique_occupy_fail = Input(Bool())
+  val busy = Output(Bool())
 }
 
 class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with MemoryOpConstants {
@@ -151,7 +154,8 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
 
   io.wbq_conflict_check.valid := s2_first && !s2_hit && !s2_bank_conflict
   io.wbq_conflict_check.bits := s2_block_addr
-  io.unique_occupy_set := Mux(s2_valid, get_idx(s2_req.vaddr), 0.U)
+  io.unique_occupy_valid := s2_valid && s2_upgrade
+  io.unique_occupy_set := Mux(io.unique_occupy_valid, get_idx(s2_req.vaddr), 0.U)
 
   val wb_block = io.wbq_block_miss_req
   val occupy_cancel = s2_upgrade && io.unique_occupy_fail
@@ -181,7 +185,8 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
   val raw_replay = s2_first && !s2_prefetch && (s2_bank_conflict || (!s2_hit && (wb_block || occupy_cancel || send_fail)))
   val raw_hit = s2_first && s2_hit && !s2_bank_conflict
   val raw_handled = send_ok
-  val raw_id = io.miss_resp.id
+  // 没被 MissArb 选中时，missResp 属于另一条请求，不能把别人的 MSHR 号发出去。
+  val raw_id = Mux(io.miss_req.fire, io.miss_resp.id, 0.U)
   val raw_nack = send_fail
 
   val resp_replay = Mux(s2_latched, s2_latch_replay, raw_replay)
@@ -237,4 +242,5 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
   assert(!(io.lsu.resp.valid && resp_hit && resp_handled), "hit and accept are mutually exclusive")
   assert(!(io.lsu.resp.valid && resp_replay && resp_handled), "replay and accept are mutually exclusive")
   assert(!s2_valid || !s2_need_data || s2_hit, "data is read only for a hitting load")
+  io.busy := s1_valid || s2_valid
 }

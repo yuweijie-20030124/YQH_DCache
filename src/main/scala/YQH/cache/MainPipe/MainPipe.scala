@@ -2,7 +2,7 @@
 // 仲裁：probe > refill > store > atomic。高优先级本拍进不了，才让下一条。
 // 同一 set 在 s1、s2 或 s3 时，新的同 set 请求不进 s0。
 //
-// 不接顶层。wbReq 就是 WriteBackReq。opcode、Resp 的编号只定义在 WriteBackQueue.scala。
+// wbReq 就是 WriteBackReq。opcode、Resp 的编号只定义在 WriteBackQueue.scala。
 // force_write 阈值按文档的 0，store 不等待 Load 让出 Data 口。
 // probeOp 就是 Compact CHI Snoop：0 MakeInvalid，1 ToInvalid，2 ToShared，3 ToClean。
 // refill 会换出有效旧行。命中或空位不写回；UD 发 WriteBackFull，干净的 SC/UC 发 Evict。
@@ -152,7 +152,11 @@ class MainPipeIO(implicit p: DCacheParameters) extends DCacheBundle {
   val block_lr = Output(Bool())
 
   // LoadPipe 命中时也来改这份 PLRU。端口 0 是 LoadPipe，MainPipe 自己的更新优先。
-  val replaceAccess = Flipped(Valid(new ReplacementAccessBundle))
+  // 两条 Load 命中可以同拍更新。口 0 是 LoadPipe 0。
+  val replaceAccess = Vec(2, Flipped(Valid(new ReplacementAccessBundle)))
+  // Probe 做完的这一拍告诉 MissQueue。finalCoh 按 Snoop 要求，不按 array 未命中当成 I。
+  val snoopNotice = Output(Valid(new MissSnoopNotice))
+  val busy = Output(Bool())
 }
 
 // 4 路树形 PLRU。bit0=1 表示左边两路刚被用过，victim 从右边挑。
@@ -160,7 +164,8 @@ class DCachePLRU(implicit p: DCacheParameters) extends DCacheModule {
   require(nways == 4)
 
   val io = IO(new Bundle {
-    val access = Vec(2, Flipped(Valid(new ReplacementAccessBundle)))
+    // 0、1 是两条 LoadPipe，2 是本拍的安装或命中写。同 set 时后面的覆盖前面的。
+    val access = Vec(3, Flipped(Valid(new ReplacementAccessBundle)))
     val querySet = Input(UInt(idxBits.W))
     val victim = Output(UInt(log2Up(nways).W))
   })
@@ -179,15 +184,16 @@ class DCachePLRU(implicit p: DCacheParameters) extends DCacheModule {
   val here = state(io.querySet)
   io.victim := Mux(!here(0), Mux(here(1), 1.U, 0.U), Mux(here(2), 3.U, 2.U))
 
-  val a0 = io.access(0)
-  val a1 = io.access(1)
-  val next0 = touch(state(a0.bits.set), a0.bits.way)
-  val base1 = Mux(a0.valid && a0.bits.set === a1.bits.set, next0, state(a1.bits.set))
-  when(a0.valid && !(a1.valid && a0.bits.set === a1.bits.set)) {
-    state(a0.bits.set) := next0
+  val cur = Wire(Vec(4, Vec(nsets, UInt(3.W))))
+  cur(0) := state
+  for (i <- 0 until 3) {
+    cur(i + 1) := cur(i)
+    when(io.access(i).valid) {
+      cur(i + 1)(io.access(i).bits.set) := touch(cur(i)(io.access(i).bits.set), io.access(i).bits.way)
+    }
   }
-  when(a1.valid) {
-    state(a1.bits.set) := touch(base1, a1.bits.way)
+  when(io.access.map(_.valid).reduce(_ || _)) {
+    state := cur(3)
   }
 }
 
@@ -824,6 +830,18 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   io.mainpipeInfo.suggestValid := s3_done && s3_suggest
   io.mainpipeInfo.suggestWay := s3_suggest_way
 
+  // 未安装的新行还在 MSHR。SnpToShared 记成 SC，失效类记成 I。
+  // SnpToClean 记成 UC：MissQueue 只对 I 和 SC 改安装结果，干净独占仍按 L2 的 Resp。
+  // takeBuffer 保持 0。置 1 会清掉 snoop_done，而 MainPipe 还没有口把 buffer 取走。
+  val snpShared = s3_hold.probeOp === CompactChiOpcode.Snp.SnpToShared
+  val snpClean = s3_hold.probeOp === CompactChiOpcode.Snp.SnpToClean
+  io.snoopNotice.valid := s3_done && s3_probe
+  io.snoopNotice.bits.addr := lineAddr(s3_hold.addr)
+  io.snoopNotice.bits.alias := s3_hold.vaddr(13, 12)
+  io.snoopNotice.bits.finalCoh := Mux(snpShared, MetaState.SC, Mux(snpClean, MetaState.UC, MetaState.I))
+  io.snoopNotice.bits.takeBuffer := false.B
+  io.busy := s1_valid || s2_valid || s3_valid
+
   val probeClears = s3_done && s3_probe && lineMatch && lrsc_count =/= 0.U
   val scClears = s3_done && s3_sc
   val lrSets = s3_done && cmdIsLr && (s3_lr || refillOp)
@@ -843,12 +861,12 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   io.update_resv_set := lrSets
   io.block_lr := (lrsc_count =/= 0.U && !clearing) || lrSets
 
-  plru.io.access(0).valid := io.replaceAccess.valid
-  plru.io.access(0).bits := io.replaceAccess.bits
+  plru.io.access(0) := io.replaceAccess(0)
+  plru.io.access(1) := io.replaceAccess(1)
   val plruTouch = s3_done && (doStoreData || doAtomicData || doInstall)
-  plru.io.access(1).valid := plruTouch
-  plru.io.access(1).bits.set := s3_hold.set
-  plru.io.access(1).bits.way := s3_way
+  plru.io.access(2).valid := plruTouch
+  plru.io.access(2).bits.set := s3_hold.set
+  plru.io.access(2).bits.way := s3_way
 
   when(s0_fire) { s1_valid := true.B }
     .elsewhen(s1_fire) { s1_valid := false.B }

@@ -202,7 +202,7 @@ load要发来的数据（一拍32B）的哪一拍根据load的地址第五<font 
 
 ## 代码实现约定
 
-文件：`src/main/scala/YQH/cache/MissingQueue/MissQueue.scala`。还没有接到顶层 DCache。
+文件：`src/main/scala/YQH/cache/MissingQueue/MissQueue.scala`。已经由 `DCache` 顶层接上。
 
 和上文冲突时，以这里为准。
 
@@ -219,7 +219,8 @@ load要发来的数据（一拍32B）的哪一拍根据load的地址第五<font 
 - 原子不合并。`missResp.sameAddr` 在请求有效、匹配到项、又不能合并时为 1。同地址已有 MSHR 时 MainPipe 发 `atomicReplay`，不再停死在 s2。别的地址占满，或被 WritebackQueue 挡住，仍然停在 s2 再试。
 - 原子 refill 最终是 I、`error`，或装成非独占时，MainPipe 在 s3 发 `atomicReplay`，不回 `atomicResp`。MSHR 仍按 `finalCoh=I` 或安装成功结束。没有合法 victim 时不 replay，置 `waitVictim`，16 拍后再送同一条 refill。
 
-- `wfi.safe` 只表示 16 个 MSHR 和 CMO 都空闲。WritebackQueue、ProbeQueue 由顶层再与上。
+- `wfi.safe` 只表示 16 个 MSHR 和 CMO 都空闲。顶层再与上 WritebackQueue、ProbeQueue、MainPipe 和两条 LoadPipe。
+- `pendingInvalidate` 只看项里已经记下的 Snoop，不看当拍刚到的 `snoop`。当拍 Snoop 仍由 `refillView` 带给还在 s2 的 refill。否则和 MainPipe s3 的完成条件会绕成组合环。
 - CMO 的 opcode 就是 Compact CHI 的 CleanShared、CleanInvalid、MakeInvalid。zero 不是 CMO。
 
 ### 原子没做成时谁来结束

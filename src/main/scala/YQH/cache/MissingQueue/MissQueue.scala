@@ -1,5 +1,5 @@
 // MissQueue 持有 16 个 MSHR，负责 load / store / 原子 / 软件预取的 miss。
-// 不接顶层，也不实现 ProbeQueue、WritebackQueue。入口仲裁是单独的 MissArb。
+// 入口仲裁是单独的 MissArb，由顶层把 MainPipe、LoadPipe0、LoadPipe1 接进来。
 //
 // 这一版没有 Credit / Retry，L2 口只有 valid/ready。
 // txnId 0～15 是 MSHR，16 是 CMO。CompAck 的 txnId 填 L2 返回的 dbId。
@@ -822,12 +822,11 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
   io.refillInfo.bits := refillView(infoEntry)
   io.refillError := infoEntry.error
 
+  // 只看已经记进项里的 Snoop。当拍的 snoop 由 refillView 带给还在 s2 的 refill。
+  // 若这里再看当拍 snoop，会和 MainPipe s3 的完成条件绕成组合环。
   val pendingEntry = entries(io.pendingQuery.bits)
-  val pendingHit = io.pendingQuery.valid && snoopNow(pendingEntry)
-  val pendingSeen = pendingEntry.pendingSnoop || pendingHit
-  val pendingFinal = Mux(pendingHit, io.snoop.bits.finalCoh, pendingEntry.snoopFinal)
   io.pendingInvalidate := io.pendingQuery.valid && pendingEntry.busy &&
-    pendingSeen && pendingFinal === MetaState.I
+    pendingEntry.pendingSnoop && pendingEntry.snoopFinal === MetaState.I
 
   for (pidx <- 0 until 3) {
     val hit = entries.map { e =>

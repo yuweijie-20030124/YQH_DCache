@@ -143,6 +143,25 @@ CMO 来自 StoreQueue，不是单独的 CMO 协处理器。StoreQueue 先把 Sto
 | wfi.safe | out | Bool | 可以休眠时为 1 |
 
 
-任一 MissEntry 还忙、CMO 还没收到 CompCMO，或者 CompAck 还没被 L2 收下，`wfi.safe` 都是 0。16 项空闲并且 CMO 空闲才为 1。
+`wfi.safe` 要同时满足：16 个 MSHR 和 CMO 都空闲、WritebackQueue 没有未完成项、ProbeQueue 的项和出口锁存都空、MainPipe 的 s1–s3 为空、两条 LoadPipe 的 s1/s2 为空。
 
-WritebackQueue 中尚未完成的 Evict 或 WriteBackFull 不计入 `wfi.safe`。
+MissQueue 自己的 `wfi.safe` 仍然只看 MSHR 和 CMO。CompAck 还没被 L2 收下时，对应 MSHR 还占着，所以这一项已经包含在里面。WritebackQueue 以前写过“不计入”，顶层接线之后改成要计入：否则核停钟时，脏行可能还没写回 L2。
+
+### 顶层接线
+
+`src/main/scala/YQH/cache/Dcache.scala` 的 `DCache` 不再是占位缓存。对外就是上面这些口，另外还有：
+
+| 字段 | 方向 | 说明 |
+| --- | --- | --- |
+| `l2` | `L2CacheIO` | Compact CHI requester。没有 Credit/Retry |
+| `forwardChi` | out，Valid | MissQueue 的 RXDAT 半行 |
+| `forwardMshr` | LSU 查询 | 按 MSHR 号读 buffer 里的半行 |
+| `refillWakeup` | out，Decoupled | 安装成功后的 load 重发 |
+| `loadReplay` | out，Decoupled | 最终没安装时的 load 重发 |
+
+Store 的 `main_pipe_hit_resp`、`refill_hit_resp`、`replay_resp` 都是 Decoupled。命中走 MainPipe `storeHit`，miss 成功走 MissQueue `storeDone`。两条 replay 合成 `replay_resp`，MainPipe s2 优先。
+
+`AtomicWordIO.req` 就是 `MainPipeReq`。probe、`snpTxnId`、`replaceWay` 这些字段保持 0。`resp` 是做完，`replay` 是没做成。
+
+txnId：0～15 给 MSHR，16 给 CMO，17～34 给 WritebackQueue。RXRSP 按这个范围拆开。TXRSP 上 WritebackQueue 的 SnpResp 优先于 MissQueue 的 CompAck。
+
