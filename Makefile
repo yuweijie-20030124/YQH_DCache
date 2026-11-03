@@ -88,6 +88,22 @@ endif
 
 srun: sim run
 
+# 只激励 storebuffer 的一笔 store，生成 logs/store-txreq.vcd。不改 DCache RTL。
+STORE_RTL := $(BUILD_DIR)/verilog-store
+STORE_OBJ := $(BUILD_DIR)/OBJ_STORE
+STORE_BIN := $(BUILD_DIR)/store-txreq
+store-sim:
+	@mkdir -p $(STORE_RTL) logs
+	mill -i sim.runMain sim.storeTbMain -td $(STORE_RTL) --emit-modules verilog
+	@rm -rf $(STORE_OBJ)
+	$(VERILATOR) -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT -Wno-PINCONNECTEMPTY \
+	  -Wno-DECLFILENAME -Wno-TIMESCALEMOD -MMD --trace --build -cc --exe -O1 \
+	  --x-assign unique --x-initial unique --timescale 1ns/1ns \
+	  -top StoreOnlyTb $(abspath sim/store_txreq/main.cpp) $(wildcard $(STORE_RTL)/*.v) \
+	  --Mdir $(STORE_OBJ) -o $(abspath $(STORE_BIN))
+	$(STORE_BIN)
+
+
 # ------------------------------------------------------------------ 清理 --
 clean:
 	-rm -rf $(BUILD_DIR) logs
@@ -104,8 +120,9 @@ help:
 	@echo "sim        用 verilator 构建 $(SIM_BIN)"
 	@echo "run        运行 $(SIM_BIN)"
 	@echo "srun       sim + run"
+	@echo "store-sim  一笔 store，波形 logs/store-txreq.vcd"
 	@echo "clean      删除 $(BUILD_DIR)/ 和 logs/"
 	@echo "clean_mill 删除 out/"
 	@echo "help       显示本帮助"
 
-.PHONY: verilog lint sim run srun clean clean_mill clean_all help
+.PHONY: verilog lint sim run srun store-sim clean clean_mill clean_all help
