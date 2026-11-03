@@ -189,7 +189,7 @@ s1 用物理 tag 判断 hit。miss 的定义是没有有效 way 的 tag 相等�
 + 不分配 MSHR。
 + 不读完整数据，也不写 array。
 + s3 向 WritebackQueue 交一条无数据 `SnpResp`，Resp 为 I，`snpTxnId` 用请求里原来的 Snoop 号。
-+ `probeResp` 同时告诉 ProbeQueue：未命中，无数据。TXRSP 由 WritebackQueue 发，不由 ProbeQueue 发。
++ `probeResp` 接回 ProbeQueue，`ready` 恒为 1。队列项在 s0 收下时就释放，不用这个回应释放。TXRSP 由 WritebackQueue 发，不由 ProbeQueue 发。
 
 | 动作 | 新 Meta | 数据 |
 | --- | --- | --- |
@@ -200,7 +200,7 @@ s1 用物理 tag 判断 hit。miss 的定义是没有有效 way 的 tag 相等�
 
 `probeOp`：Compact CHI Snoop。0 `SnpMakeInvalid`，1 `SnpToInvalid`，2 `SnpToShared`，3 `SnpToClean`。ProbeQueue 原样传入。
 
-hit 和 miss 都必须回应。Meta 没有变化时不写 Meta。数据一旦交给 WritebackQueue，ProbeQueue 要等数据发送完成后才能释放自己的条目；MainPipe 在 wbReq 握手后就可以离开 s3。
+hit 和 miss 都必须回应。Meta 没有变化时不写 Meta。数据交给 WritebackQueue 之后，MainPipe 在 `wbReq` 握手后离开 s3。ProbeQueue 的项不等数据发完；项号可能已经重用，不能靠 `probeResp.id` 去释放。
 
 同地址 Snoop 在 reservation 有效时不进入 MainPipe。窗口结束后再进入，这时按普通 Snoop 处理；如果 reservation 还在，处理这行时清除它。
 
@@ -340,4 +340,4 @@ Snoop 的 `resp` 填最终状态，不自己或上 PassDirty。旧行是 UD 时 
 | 3 | SnpToClean | UD 变成 UC，其余不变 | 只有 UD，并置 `passDirty` |
 
 
-`MainPipeReq` 增加 `snpTxnId`。ProbeQueue 以后把 RXSNP 的编号放这里。MissQueue 的 refill 填 0。无数据的 Snoop 也走 `wbReq`，否则 TXRSP 没有发送者。`wbReq` 没被收下时，s3 不改 array，也不发 `probeResp`。
+`MainPipeReq` 增加 `snpTxnId`。ProbeQueue 把 RXSNP 的编号放这里。MissQueue 的 refill 填 0。无数据的 Snoop 也走 `wbReq`，否则 TXRSP 没有发送者。`wbReq` 没被收下时，s3 不改 array，也不发 `probeResp`。
