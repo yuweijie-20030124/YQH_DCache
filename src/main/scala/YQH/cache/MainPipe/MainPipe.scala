@@ -679,7 +679,8 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val dirtyRefill = s3_refill.passDirty || s3_refill.storeMask.orR
   // 共享且带脏：先交给 WritebackQueue，本地仍可装成 SC。不能在 L1 留下 SD。
   val sharedDirty = s3_refill_req && !s3_refill.retUnique && dirtyRefill && !refillErr
-  val refillWb = sharedDirty || ((pendInv || sharedStore) && dirtyRefill && !refillErr)
+  // SnpMakeInvalid 把数据丢掉。不能再为了 pendingInvalidate 发 WriteBackFull。
+  val refillWb = !pendInv && (sharedDirty || (sharedStore && dirtyRefill && !refillErr))
 
   val storeBanks = Mux(s3_hold.storeMask.andR, Fill(DCacheBanks, 1.U), touchBanks(s3_hold.storeMask))
   val storeWords = Wire(Vec(DCacheBanks, UInt(DCacheWordBits.W)))
@@ -830,16 +831,16 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   io.mainpipeInfo.suggestValid := s3_done && s3_suggest
   io.mainpipeInfo.suggestWay := s3_suggest_way
 
-  // 未安装的新行还在 MSHR。SnpToShared 记成 SC，失效类记成 I。
-  // SnpToClean 记成 UC：MissQueue 只对 I 和 SC 改安装结果，干净独占仍按 L2 的 Resp。
+  // 只有 SnpMakeInvalid 通知 MissQueue。ToInvalid、ToShared、ToClean 不禁止安装：
+  // 数据没到时这条 Snoop 已经按旧 array 答完；数据到了则先留在 ProbeQueue。
   // takeBuffer 保持 0。置 1 会清掉 snoop_done，而 MainPipe 还没有口把 buffer 取走。
-  val snpShared = s3_hold.probeOp === CompactChiOpcode.Snp.SnpToShared
-  val snpClean = s3_hold.probeOp === CompactChiOpcode.Snp.SnpToClean
-  io.snoopNotice.valid := s3_done && s3_probe
+  val snpDrop = s3_hold.probeOp === CompactChiOpcode.Snp.SnpMakeInvalid
+  io.snoopNotice.valid := s3_done && s3_probe && snpDrop
   io.snoopNotice.bits.addr := lineAddr(s3_hold.addr)
   io.snoopNotice.bits.alias := s3_hold.vaddr(13, 12)
-  io.snoopNotice.bits.finalCoh := Mux(snpShared, MetaState.SC, Mux(snpClean, MetaState.UC, MetaState.I))
+  io.snoopNotice.bits.finalCoh := MetaState.I
   io.snoopNotice.bits.takeBuffer := false.B
+  io.snoopNotice.bits.drop := true.B
   io.busy := s1_valid || s2_valid || s3_valid
 
   val probeClears = s3_done && s3_probe && lineMatch && lrsc_count =/= 0.U

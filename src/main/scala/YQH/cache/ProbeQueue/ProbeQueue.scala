@@ -10,6 +10,8 @@
 // 因为项号在 s3 之前就已经可以重用。
 //
 // 同地址 reservation 有效时不送出。已经锁存的同地址请求拉回待发送，空出口让给别的地址。
+// MSHR 已经收齐数据且还没释放时，同地址同 alias 的 Snoop 也留在这里。
+// SnpMakeInvalid 不留，它要马上进 MainPipe，把还没安装的数据丢掉。
 // updateResvSet 当拍和下一拍都不发。当拍地址还没进寄存器，同物理行、
 // 不同 set 的 Snoop 不会被 MainPipe 的 set 冲突挡住。下一拍再按地址比较。
 package YQH.cache
@@ -47,6 +49,10 @@ class ProbeQueueIO(implicit p: DCacheParameters) extends DCacheBundle {
   val lrscLockedBlock = Input(Valid(UInt(PAddrBits.W)))
   // MainPipe 的 update_resv_set。为 1 的当拍和下一拍，不向 MainPipe 发任何 Snoop。
   val updateResvSet = Input(Bool())
+  // MissQueue：数据已经在项里。同地址同 alias 先不进 MainPipe。
+  val missHold = Input(Vec(nMissEntries, Valid(new MissSnoopHold)))
+  // 还在队列里的 SnpMakeInvalid。MissQueue 用它提前禁止安装。
+  val dropLine = Output(Vec(nProbeEntries, Valid(new MissSnoopHold)))
   val wfi = new ProbeWfi
 }
 
@@ -77,16 +83,27 @@ class ProbeQueue(implicit p: DCacheParameters) extends DCacheModule {
   def sameLine(addr: UInt): Bool =
     locked && lineAddr(addr) === lockedLine
 
+  def heldByMiss(addr: UInt, alias: UInt, opcode: UInt): Bool = {
+    val drop = opcode === CompactChiOpcode.Snp.SnpMakeInvalid
+    val hit = io.missHold.map { h =>
+      h.valid && lineAddr(h.bits.addr) === lineAddr(addr) && h.bits.alias === alias
+    }
+    !drop && hit.reduce(_ || _)
+  }
+
   val sameNow = outValid && sameLine(outBits.addr)
-  // 同地址已经锁存时拉回待发送。pause 那一拍如果也是同地址，同样拉回，出口可以换一条。
-  val pullBack = sameNow
-  io.pipeReq.valid := outValid && !stop && !sameNow
+  val missNow = outValid && heldByMiss(outBits.addr, outBits.tagAlias, outBits.probeOp)
+  // 已经锁存但现在不能发时拉回待发送，空出口让给别的地址。
+  val pullBack = sameNow || missNow
+  io.pipeReq.valid := outValid && !stop && !sameNow && !missNow
   io.pipeReq.bits := outBits
   val fire = io.pipeReq.fire
 
   val eligible = Wire(Vec(nProbeEntries, Bool()))
   for (i <- 0 until nProbeEntries) {
-    eligible(i) := entries(i).state === ProbeState.waitSend && !sameLine(entries(i).addr)
+    eligible(i) := entries(i).state === ProbeState.waitSend &&
+      !sameLine(entries(i).addr) &&
+      !heldByMiss(entries(i).addr, entries(i).tagAlias, entries(i).opcode)
   }
   val hasEligible = eligible.asUInt.orR
   val pick = PriorityEncoder(eligible.asUInt)
@@ -150,6 +167,13 @@ class ProbeQueue(implicit p: DCacheParameters) extends DCacheModule {
   }
 
   // MainPipe 把数据和应答交给 WritebackQueue。这里不再等 s3。
+  for (i <- 0 until nProbeEntries) {
+    val makeInv = entries(i).opcode === CompactChiOpcode.Snp.SnpMakeInvalid
+    io.dropLine(i).valid := entries(i).state =/= ProbeState.idle && makeInv
+    io.dropLine(i).bits.addr := entries(i).addr
+    io.dropLine(i).bits.alias := entries(i).tagAlias
+  }
+
   io.probeResp.ready := true.B
   val _ = io.wfi.req
   val busy = entries.map(_.state =/= ProbeState.idle).reduce(_ || _) || outValid
@@ -174,6 +198,8 @@ class ProbeQueue(implicit p: DCacheParameters) extends DCacheModule {
     "a just accepted snoop cannot be reused in the same cycle")
   assert(!io.pipeReq.valid || outBits.addr(blockOffBits - 1, 0) === 0.U,
     "snoop address must be line aligned")
+  assert(!io.pipeReq.valid || !heldByMiss(outBits.addr, outBits.tagAlias, outBits.probeOp),
+    "snoop must wait until the matching MSHR is released")
   assert(!io.pipeReq.valid || !io.pipeReq.bits.needData,
     "compact chi snoop has no needData")
   assert(!io.pipeReq.valid || io.pipeReq.bits.id === outIdx,

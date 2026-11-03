@@ -284,6 +284,8 @@ class DCache(implicit p:DCacheParameters) extends DCacheModule {
   miss.io.cmoWbBlock := wb.io.block(3)
 
   probe.io.pipeReq <> mp.probe
+  probe.io.missHold := miss.io.snoopHold
+  miss.io.probeDrop := probe.io.dropLine
   probe.io.probeResp <> mp.probeResp
   probe.io.lrscLockedBlock := mp.lrsc_blocked_block
   probe.io.updateResvSet := mp.update_resv_set

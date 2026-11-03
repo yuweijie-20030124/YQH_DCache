@@ -74,6 +74,13 @@ class MissSnoopNotice(implicit p: DCacheParameters) extends DCacheBundle {
   val finalCoh = UInt(2.W)
   // 父模块确认 buffer 里这份是要交出去的唯一脏拷贝。
   val takeBuffer = Bool()
+  // 只有 SnpMakeInvalid。数据直接丢掉，不安装，也不另写回。
+  val drop = Bool()
+}
+
+class MissSnoopHold(implicit p: DCacheParameters) extends DCacheBundle {
+  val addr = UInt(PAddrBits.W)
+  val alias = UInt(chi.tagAliasBits.W)
 }
 
 class MissClient(implicit p: DCacheParameters) extends DCacheBundle {
@@ -173,8 +180,12 @@ class MissQueueIO(implicit p: DCacheParameters) extends DCacheBundle {
   val storeReplay = DecoupledIO(new DCacheLineResp)
 
   val snoop = Input(Valid(new MissSnoopNotice))
+  // ProbeQueue 里还没交给 MainPipe、或刚要交出的 SnpMakeInvalid。
+  val probeDrop = Input(Vec(nProbeEntries, Valid(new MissSnoopHold)))
   val bufferTake = Input(Valid(UInt(log2Up(nMissEntries).W)))
   val bufferData = Output(UInt((blockBytes * 8).W))
+  // 数据已经在项里、项还没释放。ProbeQueue 据此留住同地址 Snoop。
+  val snoopHold = Output(Vec(nMissEntries, Valid(new MissSnoopHold)))
 
   val entryValid = Output(Vec(nMissEntries, Bool()))
   val entryAddr = Output(Vec(nMissEntries, UInt(PAddrBits.W)))
@@ -443,6 +454,10 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
     val doS3 = io.mainpipeInfo.s3Done && e.refillInflight && io.mainpipeInfo.s3MissId === mine
     val snoopHit = io.snoop.valid && e.busy && !e.refillDone && !doS3 &&
       lineOf(e.addr) === lineOf(io.snoop.bits.addr) && e.alias === io.snoop.bits.alias
+    val dropHit = io.probeDrop.map { d =>
+      d.valid && e.busy && !e.refillDone &&
+        lineOf(e.addr) === lineOf(d.bits.addr) && e.alias === d.bits.alias
+    }.reduce(_ || _)
     val beatBit = UIntToOH(dat.dataID, 2)
     val dupBeat = (e.beatValid & beatBit).orR
     val halfHigh = dat.dataID === 1.U
@@ -611,9 +626,11 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
       pendNext := false.B
       finalNext := MetaState.I
     }
-    when(snoopHit) {
+    // 只记住 SnpMakeInvalid。其它 Snoop 在数据没到时按旧 array 应答，
+    // 数据已经在项里时由 ProbeQueue 留到这项释放之后，不再禁止安装。
+    when((snoopHit && io.snoop.bits.drop) || dropHit) {
       pendNext := true.B
-      finalNext := io.snoop.bits.finalCoh
+      finalNext := MetaState.I
     }
 
     val waitNext = Wire(Bool())
@@ -825,8 +842,13 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
   // 只看已经记进项里的 Snoop。当拍的 snoop 由 refillView 带给还在 s2 的 refill。
   // 若这里再看当拍 snoop，会和 MainPipe s3 的完成条件绕成组合环。
   val pendingEntry = entries(io.pendingQuery.bits)
+  val dropNow = io.probeDrop.map { d =>
+    d.valid && lineOf(pendingEntry.addr) === lineOf(d.bits.addr) &&
+      pendingEntry.alias === d.bits.alias
+  }.reduce(_ || _)
+  // dropNow 看队列里当前的 MakeInvalid，避免 refill 已在 s3 时还来得及装上。
   io.pendingInvalidate := io.pendingQuery.valid && pendingEntry.busy &&
-    pendingEntry.pendingSnoop && pendingEntry.snoopFinal === MetaState.I
+    (dropNow || (pendingEntry.pendingSnoop && pendingEntry.snoopFinal === MetaState.I))
 
   for (pidx <- 0 until 3) {
     val hit = entries.map { e =>
@@ -863,6 +885,11 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
     readEntry.data(blockBytes * 8 - 1, chi.dataBits), readEntry.data(chi.dataBits - 1, 0))
 
   io.bufferData := entries(io.bufferTake.bits).data
+  for (i <- 0 until nMissEntries) {
+    io.snoopHold(i).valid := entries(i).busy && entries(i).dataDone
+    io.snoopHold(i).bits.addr := entries(i).addr
+    io.snoopHold(i).bits.alias := entries(i).alias
+  }
   io.l2HintSeen := entries.map(_.hintValid)
   io.entryValid := entries.map(_.busy)
   io.entryAddr := entries.map(_.addr)

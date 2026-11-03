@@ -5,6 +5,10 @@ ProbeQueue 只把 L2 发来的 Snoop 发给 MainPipe。队列有 16 项。RXSNP 
 
 同地址的 LR reservation 还有效时，这条 Snoop 留在队列里。不送给 MainPipe，也不释放。reservation 结束后再送。
 
+MSHR 已经收齐数据、项还没释放时，同地址同 alias 的 `SnpToInvalid`、`SnpToShared`、`SnpToClean` 也留在这里。不进 MainPipe，项也不释放。等这项 MSHR 释放后，再按普通 Snoop 去读已经装好的 array。`SnpMakeInvalid` 不留，马上送给 MainPipe。
+
+数据还没收齐时不留。Snoop 立即进 MainPipe，按 array 里的旧行应答。
+
 
 
 ## 参数描述

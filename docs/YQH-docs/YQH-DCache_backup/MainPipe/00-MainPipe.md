@@ -43,7 +43,7 @@ doS3Replay   = refill 上是 LR/CAS/ALU && (refill.error || pendingInvalidate ||
 
 三种要 replay 的结果：
 
-+ `pendingInvalidate`：Snoop 把最终状态打成 I。不安装，也不换出旧行。
++ `pendingInvalidate`：只有 `SnpMakeInvalid` 会把这项打成 I。不安装，不换出旧行，也不把 MSHR 里的脏数据另写回去。
 + `refill.error`：L2 的 `respErr`、重复拍或 opcode 不对。不安装，不把这份数据写回去，`finalCoh=I`。
 + 装成了非独占：`retUnique=0`，行可以装成 SC。LR、CAS、ALU 没有独占权限，不能在这行上做完，发 `atomicReplay`。SC 指令自己 miss 时不进 MSHR，直接在 s3 判失败。
 

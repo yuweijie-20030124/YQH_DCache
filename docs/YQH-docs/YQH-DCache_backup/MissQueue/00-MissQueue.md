@@ -185,6 +185,8 @@ load要发来的数据（一拍32B）的哪一拍根据load的地址第五<font 
 
 新行还没写入时，把snoop的最终状态记录到mshr项的 pendingSnoop 字段中，然后snoop按照当前在MainPipe看到的是否L1存在这行返回给L2，refill不能真安装，最终发refill的时候根据pendingSnoop字段中的状态来写meta。
 
+除了 `SnpMakeInvalid`，这里不再把 Snoop 记成禁止安装。数据没到就按旧 array 应答；数据已经在项里时，Snoop 留在 ProbeQueue，直到这项释放。见文末。
+
 <font style="color:#000000;"></font>
 
 ### <font style="color:#000000;">释放MSHR</font>
@@ -220,7 +222,7 @@ load要发来的数据（一拍32B）的哪一拍根据load的地址第五<font 
 - 原子 refill 最终是 I、`error`，或装成非独占时，MainPipe 在 s3 发 `atomicReplay`，不回 `atomicResp`。MSHR 仍按 `finalCoh=I` 或安装成功结束。没有合法 victim 时不 replay，置 `waitVictim`，16 拍后再送同一条 refill。
 
 - `wfi.safe` 只表示 16 个 MSHR 和 CMO 都空闲。顶层再与上 WritebackQueue、ProbeQueue、MainPipe 和两条 LoadPipe。
-- `pendingInvalidate` 只看项里已经记下的 Snoop，不看当拍刚到的 `snoop`。当拍 Snoop 仍由 `refillView` 带给还在 s2 的 refill。否则和 MainPipe s3 的完成条件会绕成组合环。
+- `pendingInvalidate` 看两项：已经记在 MSHR 里的 `SnpMakeInvalid`，以及 ProbeQueue 里当前还拿着的 `SnpMakeInvalid`。其它 Snoop 不禁止安装。`refillView` 仍把当拍 snoop 带给还在 s2 的 refill。
 - CMO 的 opcode 就是 Compact CHI 的 CleanShared、CleanInvalid、MakeInvalid。zero 不是 CMO。
 
 ### 原子没做成时谁来结束
@@ -232,3 +234,17 @@ load要发来的数据（一拍32B）的哪一拍根据load的地址第五<font 
 降成 SC：行可以装成 SC，`retUnique=0`。LR、CAS、ALU 没有独占权限，MainPipe 发 `atomicReplay`，不在共享行上做完。
 
 同地址已有项：`allowMerge` 不包含原子，`allowAlloc` 又要求没有匹配项，所以 `handled` 保持 0。同时 `sameAddr=1`。MainPipe 看到后走 `atomicReplay`，s2 离开，不再挡住这条 refill。`wbBlock` 时不发 miss，`sameAddr` 的 replay 条件也不成立。
+
+## 同地址 Snoop 与还在 MSHR 里的数据
+
+日期：2026-11-03。已按下面的做法实现。
+
+`ReadShared`、`ReadUnique`、`MakeUnique` 都一样，看的是 `data_done`，不是请求名字。
+
+1. 数据还没收齐：Snoop 立即进 MainPipe，按 array 的旧行应答。MissQueue 不记 `pendingSnoop`，后来的 refill 照常安装。
+2. `data_done` 已经为 1、这项还没释放：`SnpToInvalid`、`SnpToShared`、`SnpToClean` 留在 ProbeQueue，不进 MainPipe，也不记成禁止安装。refill 先把行装进 array。MSHR 释放后，Snoop 再读 array，脏数据走这条 Snoop 自己的 `SnpRespData`。
+3. `SnpMakeInvalid` 不留在队列里。它一出现在 ProbeQueue，同地址同 alias、还没 refill 完的项就把 `pendingSnoop` 记成 I。refill 当拍就能看见，不安装，也不把 buffer 写成 `WriteBackFull`。随后它仍进入 MainPipe，把 array 里的旧行丢掉。
+
+这不依赖下一次 TXREQ。留在 ProbeQueue 等的是已经收到的 RXDAT 和这项自己的释放。`RXDAT.ready` 仍然恒为 1。
+
+`takeBuffer` 仍固定为 0。不把 MSHR buffer 临时拼进 Probe 的数据通路。
