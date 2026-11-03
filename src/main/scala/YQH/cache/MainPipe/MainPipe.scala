@@ -2,20 +2,20 @@
 // 仲裁：probe > refill > store > atomic。高优先级本拍进不了，才让下一条。
 // 同一 set 在 s1、s2 或 s3 时，新的同 set 请求不进 s0。
 //
-// 这一版按本地 MainPipe 文档做 store、原子、probe 和 refill 的流水。
-// 不接顶层，也不把 Compact CHI 的 opcode 译进 probeOp。
-// probeOp：0 失效，1 降为共享，2 清脏。
+// 不接顶层。wbReq 就是 WriteBackReq。opcode、Resp 的编号只定义在 WriteBackQueue.scala。
 // force_write 阈值按文档的 0，store 不等待 Load 让出 Data 口。
-// refill 只装进命中的路，或已经是 I 的路。不在这一笔里覆盖另一条仍有效的行。
+// probeOp 就是 Compact CHI Snoop：0 MakeInvalid，1 ToInvalid，2 ToShared，3 ToClean。
+// refill 会换出有效旧行。命中或空位不写回；UD 发 WriteBackFull，干净的 SC/UC 发 Evict。
+// 旧行写回和新行的 PassDirty 共用一个 wbReq，先旧行，再新行，两笔都握手才改 array。
+// 原子没做成时走 atomicReplay：最终 I、refill error、或装成了非独占。没有 victim 时不 replay。
+// 同地址已经有 MSHR 时原子也 replay。wbBlock 和别的地址把 MSHR 占满，仍然停在 s2。
 // AMOALU 是组合逻辑，和写在同一个 s3，不再多插一拍。
-// storeHit、storeReplay、atomicReplay 都要握手。对端没接住，本级就不走，避免把一次 store 或原子丢掉。
-// occupyFail 时原子不能停在 s2：同 set 的 refill 进不来，在途升级就结束不了。这时打 atomicReplay，让 AtomicsUnit 以后重发。
-// LR、AMO、AMOCAS 一旦 miss 被收下，s2 不回 atomicResp。MissQueue 把原来的 cmd 放在 refill 上，s3 做完再回。
-// AtomicsUnit 看到 atomic.fire 之后要一直留着这笔请求，直到 atomicResp 或 atomicReplay。
+// storeHit、storeReplay、atomicReplay 都要握手。对端没接住，本级就不走。
 package YQH.cache
 
 import chisel3._
 import chisel3.util._
+import anserl2.compactchi._
 import xiangshan.cache.AMOALU
 
 object MainPipeSrc {
@@ -23,12 +23,6 @@ object MainPipeSrc {
   def ATOMIC = 1.U(2.W)
   def PROBE  = 2.U(2.W)
   def REFILL = 3.U(2.W)
-}
-
-object MainPipeProbe {
-  def TO_INVALID = 0.U(2.W)
-  def TO_SHARED  = 1.U(2.W)
-  def CLEAN      = 2.U(2.W)
 }
 
 class MainPipeReq(implicit p: DCacheParameters) extends DCacheBundle {
@@ -44,8 +38,11 @@ class MainPipeReq(implicit p: DCacheParameters) extends DCacheBundle {
   val amoData = UInt(QuadWordBits.W)
   val amoMask = UInt(QuadWordBytes.W)
   val amoCmp = UInt(QuadWordBits.W)
+  // CompactChiOpcode.Snp，ProbeQueue 原样传入。refill 不用这个字段。
   val probeOp = UInt(2.W)
   val needData = Bool()
+  // L2 原来的 Snoop 号。只有 probe 使用，refill 和原子填 0。
+  val snpTxnId = UInt(chi.txnIdBits.W)
   // one-hot。0 表示 MissQueue 还没指定路。
   val replaceWay = UInt(nways.W)
 }
@@ -56,13 +53,8 @@ class MainPipeRefillInfo(implicit p: DCacheParameters) extends DCacheBundle {
   val passDirty = Bool()
   val storeData = UInt((blockBytes * 8).W)
   val storeMask = UInt(blockBytes.W)
-}
-
-class MainPipeWbReq(implicit p: DCacheParameters) extends DCacheBundle {
-  val addr = UInt(PAddrBits.W)
-  val data = UInt((blockBytes * 8).W)
-  val passDirty = Bool()
-  val oldCoh = UInt(2.W)
+  // L2 的 respErr、重复拍或 opcode 不对。为 1 时不安装，也不把这份数据写回去。
+  val error = Bool()
 }
 
 class MainPipeProbeResp(implicit p: DCacheParameters) extends DCacheBundle {
@@ -108,6 +100,7 @@ class MainPipeHold(implicit p: DCacheParameters) extends DCacheBundle {
   val amoCmp = UInt(QuadWordBits.W)
   val probeOp = UInt(2.W)
   val needData = Bool()
+  val snpTxnId = UInt(chi.txnIdBits.W)
   val replaceWay = UInt(nways.W)
 }
 
@@ -138,10 +131,14 @@ class MainPipeIO(implicit p: DCacheParameters) extends DCacheBundle {
   val occupySet = Output(Valid(UInt(idxBits.W)))
   val occupyWay = Input(UInt(nways.W))
   val occupyFail = Input(Bool())
+  // s1 选出的 victim 物理行。MissQueue 同拍回答这行是不是已经有 MSHR。
+  val replaceQuery = Output(Valid(UInt(PAddrBits.W)))
+  val replaceBlock = Input(Bool())
   val wbQuery = Output(Valid(UInt(PAddrBits.W)))
   val wbBlock = Input(Bool())
 
-  val wbReq = DecoupledIO(new MainPipeWbReq)
+  // 与 WriteBackQueue.req 同一类型，顶层可以直接 <>。
+  val wbReq = DecoupledIO(new WriteBackReq)
   val probeResp = DecoupledIO(new MainPipeProbeResp)
   val atomicResp = DecoupledIO(new MainPipeAtomicResp)
   // occupyFail 时让 AtomicsUnit 以后重发。miss 已经被收下时不要走这条，等 refill 的 atomicResp。
@@ -203,6 +200,30 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   def lineAddr(paddr: UInt): UInt =
     Cat(paddr(PAddrBits - 1, blockOffBits), 0.U(blockOffBits.W))
 
+  // set 的高 2 位是虚拟别名，不能放进物理地址。低 6 位才是 paddr[11:6]。
+  def victimAddr(tag: UInt, set: UInt): UInt = {
+    val low = idxBits - chi.tagAliasBits
+    Cat(tag(tagBits - 1, 0), set(low - 1, 0), 0.U(blockOffBits.W))
+  }
+
+  def snpWantsData(op: UInt, coh: UInt, need: Bool): Bool = {
+    val ud = coh === MetaState.UD
+    MuxLookup(op, false.B)(Seq(
+      CompactChiOpcode.Snp.SnpMakeInvalid -> false.B,
+      CompactChiOpcode.Snp.SnpToInvalid -> (ud || need),
+      CompactChiOpcode.Snp.SnpToShared -> ud,
+      CompactChiOpcode.Snp.SnpToClean -> ud
+    ))
+  }
+
+  def snpNextCoh(op: UInt, coh: UInt): UInt =
+    MuxLookup(op, MetaState.I)(Seq(
+      CompactChiOpcode.Snp.SnpMakeInvalid -> MetaState.I,
+      CompactChiOpcode.Snp.SnpToInvalid -> MetaState.I,
+      CompactChiOpcode.Snp.SnpToShared -> MetaState.SC,
+      CompactChiOpcode.Snp.SnpToClean -> Mux(coh === MetaState.UD, MetaState.UC, coh)
+    ))
+
   def idxAddr(paddr: UInt, set: UInt): UInt =
     Cat(paddr(PAddrBits - 1, 14), set(idxBits - 1, 0), paddr(5, 0))
 
@@ -233,6 +254,11 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
 
   def wordsToLine(words: Vec[UInt]): UInt =
     Cat(words.reverse)
+
+  // 本地 Meta 到 CHI Resp。UD 在线上没有单独编码，脏用 passDirty。
+  def metaToChi(meta: UInt): UInt =
+    Mux(meta === MetaState.SC, WbChiResp.SC,
+      Mux(meta === MetaState.UC || meta === MetaState.UD, WbChiResp.UC, WbChiResp.I))
 
   def mergeLine(base: UInt, store: UInt, mask: UInt): UInt = {
     val bytes = (0 until blockBytes).map { i =>
@@ -305,6 +331,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     hold.amoCmp := req.amoCmp
     hold.probeOp := req.probeOp
     hold.needData := req.needData
+    hold.snpTxnId := req.snpTxnId
     hold.replaceWay := req.replaceWay
   }
 
@@ -329,6 +356,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     s1_hold.amoCmp := 0.U
     s1_hold.probeOp := 0.U
     s1_hold.needData := false.B
+    s1_hold.snpTxnId := 0.U
     s1_hold.replaceWay := 0.U
   }.elsewhen(io.atomic.fire) {
     fillCommon(s1_hold, io.atomic.bits, atomicSet, MainPipeSrc.ATOMIC)
@@ -344,6 +372,17 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   }
   val tagNow = Mux(s1_first, io.tagResp, s1_tag)
   val metaNow = Mux(s1_first, io.metaResp, s1_meta)
+
+  // s2 当前的权限升级要优先占用唯一的 occupy 口。声明提前，选 victim 时才看得到。
+  val s2_hit = Reg(Bool())
+  val s2_way = Reg(UInt(log2Up(nways).W))
+  val s2_coh = Reg(UInt(2.W))
+  val s2_store_now = s2_valid && s2_hold.src === MainPipeSrc.STORE
+  val s2_atomic_now = s2_valid && s2_hold.src === MainPipeSrc.ATOMIC
+  val s2_sc_now = s2_atomic_now && s2_hold.cmd === M_XSC
+  val s2_write_hit_now = s2_hit && hasWrite(s2_coh)
+  val s2_upgrade = (s2_store_now && s2_hit && s2_coh === MetaState.SC) ||
+    (s2_atomic_now && !s2_sc_now && s2_hit && !s2_write_hit_now)
 
   val hitOh = VecInit((0 until nways).map { w =>
     tagNow(w) === get_tag(s1_hold.addr) && metaNow(w).isValid
@@ -364,48 +403,77 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val isAlu1 = isAtomic1 && (isAMOLogical(s1_hold.cmd) || isAMOArithmetic(s1_hold.cmd))
   val fullStore1 = isStore1 && s1_hold.storeMask.andR
 
-  val invalidOh = VecInit((0 until nways).map(w => !metaNow(w).isValid)).asUInt
-  val hasInvalid = invalidOh.orR
-  val smallestInvalid = PriorityEncoder(invalidOh)
+  val emptyOh = VecInit((0 until nways).map { w =>
+    !metaNow(w).isValid
+  }).asUInt
   val specValid = s1_hold.replaceWay.orR
   val specWay = OHToUInt(Mux(specValid, s1_hold.replaceWay, 1.U(nways.W)))
-  val specOk = isRefill1 && !s1_hit && specValid && !metaNow(specWay).isValid
-  val useInvalid = isRefill1 && !s1_hit && !specValid && hasInvalid
+  val specEmpty = specValid && emptyOh(specWay)
+  val useSpecified = isRefill1 && !s1_hit && specEmpty
+  val useEmpty = isRefill1 && !s1_hit && !useSpecified && emptyOh.orR
+  val emptyWay = PriorityEncoder(emptyOh)
+  val needSearch = isRefill1 && !s1_hit && !useSpecified && !useEmpty
   plru.io.querySet := s1_hold.set
   val plruWay = plru.io.victim
-  val canInstall1 = !isRefill1 || s1_hit || specOk || useInvalid
-  val chosenWay1 = Mux(s1_hit, hitWay,
-    Mux(specOk, specWay, Mux(useInvalid, smallestInvalid, plruWay)))
-  // 指定了路但它还不是 I：不安装，也不另给一个 PLRU 建议。
-  val suggest1 = isRefill1 && !canInstall1 && !specValid
 
-  val probeNeed1 = isProbe1 && s1_hit && Mux(
-    s1_hold.probeOp === MainPipeProbe.TO_INVALID,
-    hitCoh === MetaState.UD || s1_hold.needData,
-    hitCoh === MetaState.UD)
+  val occupyStall = s1_valid && needSearch && s2_upgrade && s2_hold.set =/= s1_hold.set
+  io.occupySet.valid := s2_upgrade || (s1_valid && needSearch && !occupyStall)
+  io.occupySet.bits := Mux(s2_upgrade, s2_hold.set, s1_hold.set)
+  val occupyMask = Mux(s1_valid && needSearch && !occupyStall, io.occupyWay, 0.U(nways.W))
+
+  val skipVictim = RegInit(0.U(nways.W))
+  val eligible = VecInit((0 until nways).map { w =>
+    metaNow(w).isValid && !occupyMask(w) && !skipVictim(w)
+  }).asUInt
+  val hasEligible = eligible.orR
+  val plruOk = hasEligible && eligible(plruWay)
+  val victimWay = Mux(plruOk, plruWay, PriorityEncoder(eligible))
+  val replacing = needSearch && hasEligible && !occupyStall
+  val chosenWay1 = Mux(s1_hit, hitWay,
+    Mux(useSpecified, specWay, Mux(useEmpty, emptyWay, victimWay)))
+  val victimCoh = metaNow(chosenWay1).coh
+  val victimPaddr = victimAddr(tagNow(chosenWay1), s1_hold.set)
+  io.replaceQuery.valid := s1_valid && replacing
+  io.replaceQuery.bits := victimPaddr
+  val blocked = io.replaceQuery.valid && io.replaceBlock
+  when(s0_fire) {
+    skipVictim := 0.U
+  }.elsewhen(blocked) {
+    skipVictim := skipVictim | UIntToOH(victimWay, nways)
+  }
+
+  val giveUp = needSearch && !occupyStall && !hasEligible
+  val canInstall1 = !isRefill1 || s1_hit || useSpecified || useEmpty || (replacing && !blocked)
+  val willReplace = replacing && !blocked
+  val suggest1 = giveUp
+
+  val probeNeed1 = isProbe1 && s1_hit &&
+    snpWantsData(s1_hold.probeOp, hitCoh, s1_hold.needData)
   val storeNeed1 = isStore1 && hitWrite && !fullStore1 && partialBanks(s1_hold.storeMask).orR
   val atomicNeed1 = hitWrite && (isLr1 || isSc1 || isCas1 || isAlu1)
   val twoBanks1 = isAMOCASQ(s1_hold.cmd) || s1_hold.amoMask(QuadWordBytes - 1, DCacheWordBytes).orR
   val atomicBanks1 = UIntToOH(s1_hold.wordIdx, DCacheBanks) |
     Mux(twoBanks1, UIntToOH(s1_hold.wordIdx +% 1.U, DCacheBanks), 0.U(DCacheBanks.W))
-  val s1_need_data = storeNeed1 || probeNeed1 || atomicNeed1
-  val s1_bank_mask = Mux(isStore1, partialBanks(s1_hold.storeMask),
-    Mux(isProbe1, Fill(DCacheBanks, 1.U), atomicBanks1))
+  val victimNeedData = willReplace && victimCoh === MetaState.UD
+  val s1_pick_stall = occupyStall || blocked
+  val s1_need_data = !s1_pick_stall && (storeNeed1 || probeNeed1 || atomicNeed1 || victimNeedData)
+  val s1_bank_mask = Mux(victimNeedData || isProbe1, Fill(DCacheBanks, 1.U),
+    Mux(isStore1, partialBanks(s1_hold.storeMask), atomicBanks1))
 
   io.dataRead.valid := s1_valid && s1_need_data && s2_ready
   io.dataRead.bits.addr := idxAddr(s1_hold.addr, s1_hold.set)
   io.dataRead.bits.bankMask := s1_bank_mask
   val s1_data_ok = !s1_need_data || io.dataRead.ready
-  s1_fire := s1_valid && s2_ready && s1_data_ok
+  s1_fire := s1_valid && s2_ready && s1_data_ok && !s1_pick_stall
   s1_ready := !s1_valid || s1_fire
 
-  val s2_hit = Reg(Bool())
-  val s2_way = Reg(UInt(log2Up(nways).W))
-  val s2_coh = Reg(UInt(2.W))
   val s2_need_data = Reg(Bool())
   val s2_can_install = Reg(Bool())
   val s2_suggest = Reg(Bool())
   val s2_suggest_way = Reg(UInt(log2Up(nways).W))
+  val s2_replace = Reg(Bool())
+  val s2_replace_dirty = Reg(Bool())
+  val s2_replace_addr = Reg(UInt(PAddrBits.W))
   val s2_got = RegInit(false.B)
   val s2_line = Reg(Vec(DCacheBanks, Vec(nways, UInt(DCacheWordBits.W))))
 
@@ -418,6 +486,9 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     s2_can_install := canInstall1
     s2_suggest := suggest1
     s2_suggest_way := plruWay
+    s2_replace := willReplace
+    s2_replace_dirty := victimCoh === MetaState.UD
+    s2_replace_addr := victimPaddr
     s2_got := false.B
   }.elsewhen(io.dataResp.valid && s2_valid && s2_need_data && !s2_fire) {
     s2_line := io.dataResp.bits.data
@@ -431,14 +502,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val s2_refill = s2_valid && s2_hold.src === MainPipeSrc.REFILL
   val s2_sc = s2_atomic && s2_hold.cmd === M_XSC
   val s2_write_hit = s2_hit && hasWrite(s2_coh)
-  val s2_upgrade = (s2_store && s2_hit && s2_coh === MetaState.SC) ||
-    (s2_atomic && !s2_sc && s2_hit && !s2_write_hit)
   val s2_need_miss = (s2_store && !s2_write_hit) || (s2_atomic && !s2_sc && !s2_write_hit)
-
-  io.occupySet.valid := s2_upgrade
-  io.occupySet.bits := s2_hold.set
-  // occupyWay 目前只留给“覆盖有效 victim”。这一版 refill 不覆盖有效行，所以不拿它挑路。
-  dontTouch(io.occupyWay)
   val upgradeFail = s2_upgrade && io.occupyFail
 
   io.wbQuery.valid := s2_need_miss
@@ -469,18 +533,25 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val missAccepted = io.missReq.fire && io.missResp.handled
   // Store 没进 MissQueue 就回 replay，并且要等 Sbuffer 接住才离开 s2。
   val storeNeedReplay = s2_store && s2_need_miss && !missAccepted
-  // 停在 s2 会挡住同 set。权限升级被 occupyFail 拒绝时必须离开，否则那 3 路 refill 进不来。
-  val atomicNeedReplay = s2_atomic && upgradeFail
+  // occupyFail 必须离开，否则同 set 的 refill 进不来。
+  // 同地址已经有 MSHR 也不能停着：原子不合并，handled 会一直是 0。
+  // wbBlock 时 sendMiss 为 0，不在这里 replay。别的地址占满 MSHR 时 sameAddr 为 0，继续等。
+  val sameAddrReject = sendMiss && !io.missResp.handled && io.missResp.sameAddr
+  val atomicNeedReplay = s2_atomic && (upgradeFail || sameAddrReject)
   io.storeReplay.valid := storeNeedReplay
   io.storeReplay.bits.miss := false.B
   io.storeReplay.bits.replay := true.B
   io.storeReplay.bits.id := s2_hold.id
-  io.atomicReplay.valid := atomicNeedReplay
+  // s3 的 atomicReplay 在下面和这里共用这个口。s3 优先，避免 fire 把 s2 一起带走。
+  val s2Replay = Wire(Bool())
+  val s3Replay = Wire(Bool())
+  s2Replay := atomicNeedReplay && !s3Replay
+  io.atomicReplay.valid := s2Replay || s3Replay
   io.atomicReplay.bits.miss := false.B
   io.atomicReplay.bits.replay := true.B
-  io.atomicReplay.bits.id := s2_hold.id
+  io.atomicReplay.bits.id := Mux(s3Replay, s3_hold.id, s2_hold.id)
   val storeLeave = s2_store && s2_need_miss && (missAccepted || io.storeReplay.fire)
-  val atomicLeave = s2_atomic && s2_need_miss && (missAccepted || io.atomicReplay.fire)
+  val atomicLeave = s2_atomic && s2_need_miss && (missAccepted || (s2Replay && io.atomicReplay.fire))
   val missLeave = storeLeave || atomicLeave
 
   val dataOk2 = !s2_need_data || s2_got || io.dataResp.valid
@@ -499,9 +570,13 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val s3_can_install = Reg(Bool())
   val s3_suggest = Reg(Bool())
   val s3_suggest_way = Reg(UInt(log2Up(nways).W))
+  val s3_replace = Reg(Bool())
+  val s3_replace_dirty = Reg(Bool())
+  val s3_replace_addr = Reg(UInt(PAddrBits.W))
   val s3_word = Reg(Vec(DCacheBanks, UInt(DCacheWordBits.W)))
   val s3_refill = Reg(new MainPipeRefillInfo)
-  val sent = RegInit(VecInit(Seq.fill(7)(false.B)))
+  // 0 tag，1 meta，2 data，3 第一笔写回，4 probeResp，5 atomicResp，6 storeHit，7 第二笔写回，8 atomicReplay。
+  val sent = RegInit(VecInit(Seq.fill(9)(false.B)))
 
   when(s2_fire) {
     s3_hold := s2_hold
@@ -511,6 +586,9 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     s3_can_install := s2_can_install
     s3_suggest := s2_suggest
     s3_suggest_way := s2_suggest_way
+    s3_replace := s2_replace
+    s3_replace_dirty := s2_replace_dirty
+    s3_replace_addr := s2_replace_addr
     for (b <- 0 until DCacheBanks) {
       s3_word(b) := dataNow(b)(s2_way)
     }
@@ -522,10 +600,12 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     when(io.tagWrite.fire) { sent(0) := true.B }
     when(io.metaWrite.fire) { sent(1) := true.B }
     when(io.dataWrite.fire) { sent(2) := true.B }
-    when(io.wbReq.fire) { sent(3) := true.B }
+    when(io.wbReq.fire && !sent(3)) { sent(3) := true.B }
+    when(io.wbReq.fire && sent(3)) { sent(7) := true.B }
     when(io.probeResp.fire) { sent(4) := true.B }
     when(io.atomicResp.fire) { sent(5) := true.B }
     when(io.storeHit.fire) { sent(6) := true.B }
+    when(s3Replay && io.atomicReplay.fire) { sent(8) := true.B }
   }
 
   val s3_store = s3_valid && s3_hold.src === MainPipeSrc.STORE
@@ -562,16 +642,10 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val old128 = Cat(old1, old0)
   val casMismatch = ((old128 ^ s3_hold.amoCmp) & FillInterleaved(8, s3_hold.amoMask)).orR
 
-  val probeNew = MuxLookup(s3_hold.probeOp, s3_coh)(Seq(
-    MainPipeProbe.TO_INVALID -> MetaState.I,
-    MainPipeProbe.TO_SHARED -> MetaState.SC,
-    MainPipeProbe.CLEAN -> Mux(s3_coh === MetaState.UD, MetaState.UC, s3_coh)
-  ))
+  val probeNew = snpNextCoh(s3_hold.probeOp, s3_coh)
   val probeWriteMeta = s3_probe && s3_hit && probeNew =/= s3_coh
-  val probeNeedWb = s3_probe && s3_hit && Mux(
-    s3_hold.probeOp === MainPipeProbe.TO_INVALID,
-    s3_coh === MetaState.UD || s3_hold.needData,
-    s3_coh === MetaState.UD)
+  val probeNeedWb = s3_probe && s3_hit &&
+    snpWantsData(s3_hold.probeOp, s3_coh, s3_hold.needData)
 
   io.pendingSnoop.valid := s3_refill_req
   io.pendingSnoop.bits := s3_hold.missId
@@ -588,7 +662,8 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val cmdIsAlu = isAMOLogical(s3_hold.cmd) || isAMOArithmetic(s3_hold.cmd)
   // 共享行没有写权限。store 合并出现在共享 refill 上时不安装，把合并后的数据写回去。
   val sharedStore = s3_refill_req && s3_refill.storeMask.orR && !s3_refill.retUnique
-  val doInstall = s3_refill_req && s3_can_install && !pendInv && !sharedStore
+  val refillErr = s3_refill_req && s3_refill.error
+  val doInstall = s3_refill_req && s3_can_install && !pendInv && !sharedStore && !refillErr
   // miss 被收下之后，AtomicsUnit 不再重发。refill 带着原来的 cmd，在这一拍做完。
   val refillOp = doInstall && s3_refill.retUnique && (cmdIsLr || cmdIsCas || cmdIsAlu)
   val casFail = (s3_cas || (refillOp && cmdIsCas)) && casMismatch
@@ -597,8 +672,8 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val installCoh = Mux(refillMutate || refillStore, MetaState.UD, refillCoh)
   val dirtyRefill = s3_refill.passDirty || s3_refill.storeMask.orR
   // 共享且带脏：先交给 WritebackQueue，本地仍可装成 SC。不能在 L1 留下 SD。
-  val sharedDirty = s3_refill_req && !s3_refill.retUnique && dirtyRefill
-  val refillWb = sharedDirty || ((pendInv || sharedStore) && dirtyRefill)
+  val sharedDirty = s3_refill_req && !s3_refill.retUnique && dirtyRefill && !refillErr
+  val refillWb = sharedDirty || ((pendInv || sharedStore) && dirtyRefill && !refillErr)
 
   val storeBanks = Mux(s3_hold.storeMask.andR, Fill(DCacheBanks, 1.U), touchBanks(s3_hold.storeMask))
   val storeWords = Wire(Vec(DCacheBanks, UInt(DCacheWordBits.W)))
@@ -635,9 +710,20 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val doTag = doInstall
   val doMeta = probeWriteMeta || doStoreMeta || doAtomicMeta || doInstall
   val doData = doStoreData || doAtomicData || doInstall
-  val doWb = probeNeedWb || refillWb
+  // 命中带数据、未命中、以及命中但不带数据，都从这条口出去。
+  // 无数据的是 SnpResp，WriteBackQueue 才发 TXRSP。
+  val keepShared = sharedDirty && doInstall
+  // 只有真的要盖掉旧行时才写回 victim。error 或最终 I 不安装，旧行留在 array 里。
+  val victimWb = s3_replace && doInstall
+  val lineWb = refillWb
+  val doWb1 = s3_probe || victimWb || lineWb
+  val doWb2 = victimWb && lineWb
   val doProbeResp = s3_probe
   val doAtomicResp = s3_atomic || refillOp
+  val refillAtomicCmd = s3_refill_req && (cmdIsLr || cmdIsCas || cmdIsAlu)
+  val downgraded = doInstall && !s3_refill.retUnique
+  // 没有合法 victim 时不在这里。MSHR 会 waitVictim 再试，replay 会让新的原子挡住这次 refill。
+  val doS3Replay = refillAtomicCmd && (refillErr || pendInv || downgraded)
 
   val writeWords = Mux(s3_refill_req, Mux(refillMutate, atomicWords, refillWords),
     Mux(s3_store, storeWords, atomicWords))
@@ -646,9 +732,11 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val newCoh = Mux(s3_probe, probeNew,
     Mux(s3_refill_req, installCoh, MetaState.UD))
 
-  // wbReq 没握上手之前，不改 array，也不先把 probe 响应发出去。
-  io.wbReq.valid := s3_valid && doWb && !sent(3)
-  val wbClear = !doWb || sent(3) || io.wbReq.fire
+  // 两笔写回都握手之前，不改 array。先 victim，再新行的 PassDirty / WriteBackFull。
+  val wb1Fire = io.wbReq.fire && !sent(3)
+  val wb2Fire = io.wbReq.fire && sent(3)
+  io.wbReq.valid := s3_valid && ((doWb1 && !sent(3)) || (doWb2 && sent(3) && !sent(7)))
+  val wbClear = (!doWb1 || sent(3) || wb1Fire) && (!doWb2 || sent(7) || wb2Fire)
   def armed(need: Bool, idx: Int): Bool = s3_valid && need && !sent(idx) && wbClear
   io.tagWrite.valid := armed(doTag, 0)
   io.tagWrite.bits.idx := s3_hold.set
@@ -668,18 +756,36 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   io.dataWrite.bits.bankMask := writeBanks
   io.dataWrite.bits.data := writeWords
 
-  io.wbReq.bits.addr := lineAddr(s3_hold.addr)
-  io.wbReq.bits.data := Mux(s3_refill_req, refillLine, wordsToLine(s3_word))
-  io.wbReq.bits.passDirty := Mux(s3_probe, s3_coh === MetaState.UD, true.B)
-  io.wbReq.bits.oldCoh := Mux(s3_refill_req, MetaState.UD, s3_coh)
+  val sendSecond = sent(3) && doWb2
+  val wbIsVictim = victimWb && !sendSecond
+  val wbIsProbe = s3_probe
+  val probeOpcode = Mux(probeNeedWb, WbOpcode.SnpRespData, WbOpcode.SnpResp)
+  val victimOpcode = Mux(s3_replace_dirty, WbOpcode.WriteBackFull, WbOpcode.Evict)
+  val lineOpcode = Mux(keepShared, WbOpcode.PassDirty, WbOpcode.WriteBackFull)
+  val wbOpcode = Mux(wbIsProbe, probeOpcode, Mux(wbIsVictim, victimOpcode, lineOpcode))
+  val wbPassDirty = Mux(wbIsProbe, probeNeedWb && s3_coh === MetaState.UD,
+    Mux(wbIsVictim, s3_replace_dirty, true.B))
+  val wbResp = Mux(wbIsProbe, Mux(s3_hit, metaToChi(probeNew), WbChiResp.I),
+    Mux(wbIsVictim, WbChiResp.I, Mux(keepShared, WbChiResp.SC_PD, WbChiResp.I)))
+  io.wbReq.bits.addr := Mux(wbIsVictim, s3_replace_addr, lineAddr(s3_hold.addr))
+  io.wbReq.bits.data := Mux(wbIsProbe, Mux(probeNeedWb, wordsToLine(s3_word), 0.U),
+    Mux(wbIsVictim, Mux(s3_replace_dirty, wordsToLine(s3_word), 0.U),
+      Mux(lineWb, refillLine, 0.U)))
+  io.wbReq.bits.opcode := wbOpcode
+  io.wbReq.bits.resp := wbResp
+  io.wbReq.bits.passDirty := wbPassDirty
+  io.wbReq.bits.respErr := 0.U(chi.respErrBits.W)
+  io.wbReq.bits.snpTxnId := Mux(wbIsProbe, s3_hold.snpTxnId, 0.U)
 
   def channelDone(need: Bool, fire: Bool, idx: Int): Bool = !need || sent(idx) || fire
-  // 数组和写回都接住之后才给响应。否则对端已经看到完成，数据却还没写进 array。
+  // 数组和写回都接住之后才给响应。两笔写回不能被同一次 fire 一起记成完成。
   val writesDone =
     channelDone(doTag, io.tagWrite.fire, 0) &&
       channelDone(doMeta, io.metaWrite.fire, 1) &&
       channelDone(doData, io.dataWrite.fire, 2) &&
-      channelDone(doWb, io.wbReq.fire, 3)
+      channelDone(doWb1, wb1Fire, 3) &&
+      channelDone(doWb2, wb2Fire, 7)
+  s3Replay := s3_valid && doS3Replay && !sent(8) && writesDone
   io.probeResp.valid := s3_valid && doProbeResp && !sent(4) && writesDone
   io.probeResp.bits.id := s3_hold.id
   io.probeResp.bits.hit := s3_hit
@@ -702,16 +808,19 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     channelDone(doTag, io.tagWrite.fire, 0) &&
     channelDone(doMeta, io.metaWrite.fire, 1) &&
     channelDone(doData, io.dataWrite.fire, 2) &&
-    channelDone(doWb, io.wbReq.fire, 3) &&
+    channelDone(doWb1, wb1Fire, 3) &&
+    channelDone(doWb2, wb2Fire, 7) &&
     channelDone(doProbeResp, io.probeResp.fire, 4) &&
     channelDone(doAtomicResp, io.atomicResp.fire, 5) &&
-    channelDone(s3_store, io.storeHit.fire, 6)
+    channelDone(s3_store, io.storeHit.fire, 6) &&
+    channelDone(doS3Replay, s3Replay && io.atomicReplay.fire, 8)
   s3_ready := !s3_valid || s3_done
 
   io.mainpipeInfo.s3Done := s3_done && s3_refill_req
   io.mainpipeInfo.s3MissId := s3_hold.missId
   io.mainpipeInfo.installed := s3_done && doInstall
-  io.mainpipeInfo.finalCoh := Mux(doInstall, installCoh, refillCoh)
+  io.mainpipeInfo.finalCoh := Mux(refillErr || pendInv, MetaState.I,
+    Mux(doInstall, installCoh, refillCoh))
   io.mainpipeInfo.suggestValid := s3_done && s3_suggest
   io.mainpipeInfo.suggestWay := s3_suggest_way
 
@@ -763,8 +872,26 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   assert(!s3_valid || !s3_refill_req || s3_can_install || !doInstall,
     "refill must not install without a legal way")
   assert(!s3_valid || !sharedStore, "store data cannot be merged into a shared refill")
-  assert(!io.atomicReplay.valid || !io.missReq.valid,
-    "atomic replay is only used when the miss is not sent")
+  assert(!s2Replay || !io.missResp.handled,
+    "s2 atomic replay must not accept the miss")
+  assert(!(s2Replay && s3Replay),
+    "s2 and s3 must not drive atomicReplay together")
+  assert(!doAtomicResp || !doS3Replay,
+    "atomic completion and atomic replay are mutually exclusive")
+  assert(!s3_valid || !refillErr || !doInstall,
+    "a refill error must not install")
+  assert(!io.wbReq.valid || io.wbReq.bits.opcode =/= WbOpcode.Evict || !io.wbReq.bits.passDirty,
+    "Evict does not carry dirty data")
+  assert(!io.replaceQuery.valid || io.replaceQuery.bits(blockOffBits - 1, 0) === 0.U,
+    "victim query must be line aligned")
+  assert(!s3_valid || s3_hold.probeOp =/= CompactChiOpcode.Snp.SnpMakeInvalid || !probeNeedWb,
+    "SnpMakeInvalid does not return data")
+  assert(!io.wbReq.valid || wbOpcode =/= WbOpcode.SnpResp || !wbPassDirty,
+    "SnpResp does not carry dirty data")
+  assert(!io.wbReq.valid || wbOpcode =/= WbOpcode.PassDirty || wbPassDirty,
+    "PassDirty writeback must set passDirty")
+  assert(!io.wbReq.valid || !s3_probe || s3_hold.snpTxnId === io.wbReq.bits.snpTxnId,
+    "snoop writeback must keep the original txnId")
   assert(!(io.storeHit.valid && io.storeReplay.valid &&
     io.storeHit.bits.id === io.storeReplay.bits.id),
     "one store cannot hit and replay together")
