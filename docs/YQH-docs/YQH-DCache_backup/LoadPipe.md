@@ -1,5 +1,5 @@
 ## 框架图<img src="https://cdn.nlark.com/yuque/0/2026/png/35409901/1793193722819-d3e89162-18c9-465f-87a6-1732050c06c7.png" width="713.6" title="" crop="0,0,1,1" id="ue1b2dde9" class="ne-image">
-设计的想法是没有 way predict，两级loadpipe流水线。与香山不一样的地方是s1流水线中行为不同，在s1获得物理地址后与4个tag进行比较获得真实way，再拿真实way去访问DataArray。
+设计的想法是没有 way predict。Tag 和 Meta 要下一拍才出数，Data 也要再一拍，所以是 s0、s1、s2 三级。s1 用物理地址和 4 路 tag 比较出真实 way，判断 hit 之后仍然按 bank 把该 bank 的 4 路 Data 一起读出。Data 只有 8 块 SRAM，不能只打开命中的那一路。s2 再用这个 way 从 4 路结果里挑数据。
 
 ****
 
@@ -60,3 +60,4 @@ LoadPipe如果要申请UC权限(SC的情况下写预取)，需要向MissQueue申
 
 ### 查询WriteBack的Block
 一条miss的load指令loadpipe在s2级流水线要访问WBQ，如果这条mmiss的物理行地址在WBQ中，也就是如果本次的miss已经在写回中，就不允许发出MissReq了。
+

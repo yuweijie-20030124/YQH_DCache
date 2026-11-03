@@ -89,13 +89,13 @@ StoreBuffer 把地址和数据都准备好之后才进入 MainPipe 的 store 口
 
 | 结果 | 时机 | 说明 |
 | --- | --- | --- |
-| hit 成功 | store 流水的 s3 | 命中且有写权限，数据和 Meta 已经写入 |
-| miss 成功 | 这次 refill 的 s3 | 行已经安装，需要交出的 victim 也已经进 WritebackQueue |
-| replay | s2 不能发 `missReq`，或 MissQueue 拒绝 | MSHR 拒绝、同地址写回还在 WritebackQueue、way 占用冲突。StoreBuffer 以后重发。s3 不写 array |
+| hit 成功 | store 流水的 s3，`storeHit` 握手 | 命中且有写权限。Tag、Meta、Data 已经接住之后才 valid。Sbuffer 没接住，s3 不走 |
+| miss 成功 | 这次 refill 的 s3 | 行已经安装。需要换出的旧行，以及新行要交出的脏数据，都已经进 WritebackQueue。UD 旧行是 WriteBackFull，干净旧行是 Evict |
+| replay | s2，`storeReplay` 握手 | MSHR 拒绝、同地址写回还在 WritebackQueue、`occupyFail`。要等 StoreBuffer 接住才离开 s2。s3 不写 array |
 
 
 ### AtomicWordIO
-LR、SC、AMO、AMOCAS 从 AtomicsUnit 进入 MainPipe 的 atomic 口。第一次查找不走 LoadPipe，也不走 StoreBuffer。miss 时 s2 发 `missReq`；数据回来后不再进 atomic，改走 refill，在同一次 s3 里安装并完成运算，然后给 AtomicsUnit 响应。
+LR、SC、AMO、AMOCAS 从 AtomicsUnit 进入 MainPipe 的 atomic 口。第一次查找不走 LoadPipe，也不走 StoreBuffer。miss 时 s2 发 `missReq`；数据回来后不再进 atomic，改走 refill，在同一次 s3 里安装并完成运算，然后给 AtomicsUnit 响应。`atomic.fire` 不是完成。AtomicsUnit 要留着请求，直到 `atomicResp` 或 `atomicReplay`。
 
 **原子指令执行期间，核内不再向 DCache 发 load、store 或另一条原子。**
 
@@ -120,7 +120,7 @@ LR、SC、AMO、AMOCAS 从 AtomicsUnit 进入 MainPipe 的 atomic 口。第一�
 | id | out | 对应请求 |
 | data | out | 旧值。SC 失败时按约定返回失败标志，不写内存 |
 | success | out | 只有 SC 使用。reservation 检查失败时为 0，并且不创建 MSHR |
-| replay | out | MissQueue 没接住或被 WritebackQueue 挡住。AtomicsUnit 以后重发，这一拍没有结果 |
+| replay | out | 单独的 `atomicReplay`。s2 在 `occupyFail` 或同地址已有 MSHR 时握手。`wbBlock` 和别的地址占满 MSHR 时停在 s2。refill 最终 I、error 或装成非独占时，s3 再握一次。独占做完走 `atomicResp`，不走这条 |
 
 
 SC 在 MainPipe 里 reservation 检查失败时，不进入 MissQueue。

@@ -4,15 +4,54 @@
 它处理六类会改 cache 的事务：
 
 + Sbuffer 提交的 store 数据。命中且有写权限时按字节合并后写入；没有写权限时在 s2 发送MissReq给 MissQueue，不进入 s3。
-+ MissQueue 的 refill。把已经拼好的 64B 数据装进 tag 命中的那一路。replace在refill的途中做完。
++ MissQueue 的 refill。把已经拼好的 64B 数据装进命中路、空位，或换出来的 victim。替换就在这次 refill 里做完，没有单独的 replace 入口。
 + ProbeQueue 转发来的 Snoop。查当前 cache，命中才改 Meta，需要数据时把整行交给 WritebackQueue。miss 不分配 MSHR，也不变成 refill。
 + AtomicsUnit 来的 LR、SC、AMO、AMOCAS。
 
+## 本版 RTL 已经定下的行为
 
+下面这些是写 `MainPipe.scala` 时定下来的。和本节旧句子不一致时，以这里为准。
 
++ 高优先级被自己的 set 挡住时，不冻结其它 set。probe 进不去，另一个 set 的 refill、store、atomic 仍可以进。
++ `storeHit`、`storeReplay`、`atomicResp`、`atomicReplay` 都是 Decoupled。对端没接住，本级就不走，不能打成一拍脉冲丢掉。
++ 原子离开 s2 并走 `atomicReplay` 有两种：`occupyFail`，以及同地址已经有 MSHR（`handled=0` 且 `sameAddr=1`）。`wbBlock` 时 `sendMiss=0`，停在 s2 继续等。别的地址把 16 项占满时 `sameAddr=0`，也停在 s2 再试。store 仍然是任何拒绝都 replay。
++ LR、AMO、AMOCAS 的 miss 被收下后，s2 不回 `atomicResp`。refill 带原来的 cmd、amo 数据和 id。独占行真的装上时，s3 做完回 `atomicResp`。最终 I、`refill.error`，或装成了非独占，s3 改走 `atomicReplay`。不用 `success=0` 冒充做完。没有合法 victim 时不 replay，MissQueue 置 `waitVictim`，16 拍后再试。`atomic.fire` 之后，AtomicsUnit 留着请求，直到 `atomicResp` 或 `atomicReplay`。
++ Tag、Meta、Data 和两笔 `wbReq` 都接住之后，才发 `probeResp`、`atomicResp`、`storeHit`、s3 的 `atomicReplay`。
++ refill 合并了 store，并且返回独占时，安装成 UD，不能停在 UC。共享 refill 上出现 store mask 则不安装，并断言。`pendingInvalidate` 或 `refill.error` 时最终状态是 I，不写 array，也不换出旧行。共享且脏、这次又真的安装时，先把脏责任写成 PassDirty，本地装 SC。
++ 四路都有效时会换出 victim。`occupyWay` 标出正在升级的路，这些路不能当 victim。`force_write` 不实现，等价于文档里的阈值 0，store 不等 Load 让出 Data 口。
++ `probeOp` 就是 Compact CHI 的 Snoop opcode，ProbeQueue 原样放进来，MainPipe 不再做第二套翻译。0 是 `SnpMakeInvalid`，1 是 `SnpToInvalid`，2 是 `SnpToShared`，3 是 `SnpToClean`。
++ 端口名是 `invalid_resv_set`。文档里的 `invalid_rescv_set` 是笔误。它为 1，并且本拍不是新建 LR 时，把 `lrsc_count` 清 0。
++ `tagWrite.vaddr` 只送低 34 bit。Tag SRAM 不保存这个字段，端口是停用 WPU 留下来的。真正写入的物理 tag 是 36 bit，`paddr[47:12]`。
++ `mainpipeInfo` 的 `s3Done`、`installed`、`suggestValid` 只在 s3 完成的那一拍为高。MissQueue 要当拍采样。
++ `missReq.addr` 按 cache line 对齐。
 
+## 原子没做成时怎么结束
 
+日期：2026-11-03。上面两处以前会让 AtomicsUnit 一直等。代码已经补上，旧说法作废。
 
+原子 miss 被收下后，s2 仍然立刻离开，这一拍没有 `atomicResp`，也没有 `atomicReplay`。完成放在后来的 refill 上。`atomic.fire` 不是完成。
+
+s3 把「做完」和「没做成」拆开：
+
+```
+doAtomicResp = s3 命中原子 || refillOp
+refillOp     = doInstall && retUnique && (LR || CAS || ALU)
+doS3Replay   = refill 上是 LR/CAS/ALU && (refill.error || pendingInvalidate || 装成了非独占)
+```
+
+`refillOp` 仍然要求独占行真的装进 array。最终 I 不能装进去，否则刚被 Snoop 作废的行又变成有效。这时 `doAtomicResp=0`，`doS3Replay=1`，s3 等写回握完手之后发 `atomicReplay`。AtomicsUnit 以后重发。MSHR 看到 `finalCoh=I`，这项可以结束。
+
+三种要 replay 的结果：
+
++ `pendingInvalidate`：Snoop 把最终状态打成 I。不安装，也不换出旧行。
++ `refill.error`：L2 的 `respErr`、重复拍或 opcode 不对。不安装，不把这份数据写回去，`finalCoh=I`。
++ 装成了非独占：`retUnique=0`，行可以装成 SC。LR、CAS、ALU 没有独占权限，不能在这行上做完，发 `atomicReplay`。SC 指令自己 miss 时不进 MSHR，直接在 s3 判失败。
+
+没有合法 victim 时不走 `atomicReplay`。replay 会让 AtomicsUnit 马上再发一条原子，挡住这次 refill，两边都走不完。MissQueue 置 `waitVictim`，16 拍后再把同一条 refill 送进来。
+
+同地址已经有 MSHR 时，s2 不再停死。MissQueue 给出 `sameAddr = 请求有效 && 匹配到项 && 不能合并`。原子不合并，所以这条为 1。`atomicNeedReplay` 把它和 `occupyFail` 放在一起，s2 等 `atomicReplay` 握上手才离开。`wbBlock` 时不发 miss，也就不因此 replay，停在 s2 等写回结束。16 项都被别的地址占满时 `sameAddr=0`，同样停在 s2 再试。store 看的是「没被收下」，任何拒绝都 replay，这点没改。
+
+s2 和 s3 共用一个 `atomicReplay`。s3 优先。两边不会同时拉高。`atomicResp` 和 `atomicReplay` 也不会同时表示同一笔做完又要重来。
 
 ## 接口描述
 这里的方向是从MainPipe的视角来看的in/out。
@@ -56,24 +95,39 @@
 | mainpipeInfo | out | s2/s3 | 告诉对应 MSHR：数据还没准备好、s3 已提交、本地安装决定已做完 |
 | pendingSnoop | in | missId 查询 | s3 写 Meta 前再看一眼该 MSHR 有没有未处理完的同地址 Snoop |
 | <font style="color:#000000;">occupySet</font> | <font style="color:#000000;">out</font> | <font style="color:#000000;">set</font> | <font style="color:#000000;">store 或原子做权限升级时，问这个 set</font> |
-| <font style="color:#000000;">occupyWay</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">4 bit</font> | <font style="color:#000000;">这个 set 上正在权限升级的 way。refill 选 victim 时不能选这些 way</font> |
+| <font style="color:#000000;">occupyWay</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">4 bit</font> | <font style="color:#000000;">正在升级的路。refill 选 victim 时跳过，避免盖掉还没升级完的行</font> |
 | <font style="color:#000000;">occupyFail</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">Bool</font> | <font style="color:#000000;">这个 set 已经有 3 路在途权限升级。新的权限升级本拍不要发 missReq</font> |
 | <font style="color:#000000;">wbBlock</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">同地址查询</font> | <font style="color:#000000;">同地址写回还在 WritebackQueue 时，本拍不发 missReq</font> |
 
 
-`missReq` 带上地址、vaddr、alias、cmd、store 数据与 mask、原子数据、当前 Meta、是否整行覆盖。选 ReadShared、ReadUnique 还是 MakeUnique 由 MissQueue 决定。
+`missReq.addr` 按 cache line 对齐，再带上 vaddr、alias、cmd、store 数据与 mask、原子数据、当前 Meta、是否整行覆盖。选 ReadShared、ReadUnique 还是 MakeUnique 由 MissQueue 决定。
 
 
 
 ### <font style="color:#000000;">WritebackQueue</font>
 
+| 信号 | 方向 | 类型 | 作用 |
+| --- | --- | --- | --- |
+| wbQuery / wbBlock | out / in | 同地址查询 | s2 要发 miss 之前问。同地址写回还在时，本拍不发 missReq |
+| wbReq | out | Decoupled WriteBackReq | 和 WriteBackQueue.req 同一类型，顶层可以直接 `<>`。字段和编码见文末「代码实现约定」 |
+
+### 完成响应
+
+| 信号 | 方向 | 类型 | 作用 |
+| --- | --- | --- | --- |
+| storeHit | out | Decoupled | s3 命中写入已经进 array 之后，告诉 Sbuffer 成功 |
+| storeReplay | out | Decoupled | s2 的 store miss 没被收下。要等 Sbuffer 接住才离开 |
+| atomicResp | out | Decoupled | s3 做完，或者 refill 上的原子做完。带 id、旧数据和 SC 的 success |
+| atomicReplay | out | Decoupled | 只用于 `occupyFail`。AtomicsUnit 以后重发。miss 已经被收下时不要走这条 |
+| probeResp | out | Decoupled | hit 和 miss 都在 s3 回应。数组写和 wbReq 接住之后才发 |
+| mainpipeInfo | out | 电平，完成位只脉冲一拍 | `s2Wait` 表示 refill 还没有整行数据。`s3Done`、`installed`、`suggestValid` 只在完成那一拍为高 |
 
 ### ProbeQueue
 | <font style="color:#000000;">信号</font> | <font style="color:#000000;">方向</font> | <font style="color:#000000;">类型</font> | <font style="color:#000000;">作用</font> |
 | :--- | :--- | :--- | :--- |
 | <font style="color:#000000;">lrsc_blocked_block</font> | <font style="color:#000000;">out</font> | Valid(UInt(PAddrBits.W)) | <font style="color:#000000;">valid的时候是计数大于8，bits就是lrsc_addr，也就是cacheline的地址</font> |
 | <font style="color:#000000;">update_resv_set</font> | <font style="color:#000000;">out</font> | <font style="color:#000000;">Bool()</font> | <font style="color:#000000;">LR在Mainpipe建立reservation的时候为1，让下一拍ProbeQueue阻塞所有的Probe</font> |
-| <font style="color:#000000;">invalid_rescv_set</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">Bool()</font> | <font style="color:#000000;">reservation有效时，进来SC，下一排把lrsc_count请0</font> |
+| <font style="color:#000000;">invalid_resv_set</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">Bool()</font> | <font style="color:#000000;">为 1 且本拍不是新建 LR 时，把 lrsc_count 清 0。旧名 invalid_rescv_set 是笔误</font> |
 | <font style="color:#000000;">block_lr</font> | <font style="color:#000000;">out</font> | <font style="color:#000000;">Bool()</font> | <font style="color:#000000;">告诉AtomicsUnit阻塞lr。</font> |
 
 
@@ -115,13 +169,17 @@ s1 选 way，顺序固定：
 | 返回权限 | PassDirty | 安装结果 |
 | --- | --- | --- |
 | 共享 | 否 | SC |
-| 独占 | 否 | UC |
+| 独占 | 否 | UC。refill 上还有 store mask，或本拍原子真的写入，则改成 UD |
 | 独占 | 是 | UD |
 
 
 共享并且 PassDirty 的数据不在 L1 收成 SD。安装前先把脏数据交给 WritebackQueue，本地只留 SC。
 
-s3 写 tag、data、meta。写完向 MissQueue 回 `s3RefillResp`。
+共享 refill 上出现 store mask 是非法合并。不安装，断言。脏数据仍交给 WritebackQueue。
+
+`pendingInvalidate` 为 1 时，最终状态是 I，Tag、Meta、Data 都不写。PassDirty 或 store 带来的脏数据仍交给 WritebackQueue。
+
+s3 在 Tag、Meta、Data 和 `wbReq` 都接住之后，用 `mainpipeInfo` 告诉 MissQueue。`s3Done`、`installed`、`suggestValid` 只在完成那一拍为高。没有单独的 `s3RefillResp`。
 
 
 
@@ -130,8 +188,8 @@ s1 用物理 tag 判断 hit。miss 的定义是没有有效 way 的 tag 相等�
 
 + 不分配 MSHR。
 + 不读完整数据，也不写 array。
-+ s3 回应 ProbeQueue：状态 I，无数据。
-+ ProbeQueue 发 TXRSP，不发 TXDAT。
++ s3 向 WritebackQueue 交一条无数据 `SnpResp`，Resp 为 I，`snpTxnId` 用请求里原来的 Snoop 号。
++ `probeResp` 同时告诉 ProbeQueue：未命中，无数据。TXRSP 由 WritebackQueue 发，不由 ProbeQueue 发。
 
 | 动作 | 新 Meta | 数据 |
 | --- | --- | --- |
@@ -139,6 +197,8 @@ s1 用物理 tag 判断 hit。miss 的定义是没有有效 way 的 tag 相等�
 | 降为共享 | SC。原来已是 SC 则不变 |  UD 时带数据，并 PassDirty |
 | 清理脏责任 | UD 变为 UC，其余不变 |  UD 时带数据，并 PassDirty |
 
+
+`probeOp`：Compact CHI Snoop。0 `SnpMakeInvalid`，1 `SnpToInvalid`，2 `SnpToShared`，3 `SnpToClean`。ProbeQueue 原样传入。
 
 hit 和 miss 都必须回应。Meta 没有变化时不写 Meta。数据一旦交给 WritebackQueue，ProbeQueue 要等数据发送完成后才能释放自己的条目；MainPipe 在 wbReq 握手后就可以离开 s3。
 
@@ -208,32 +268,76 @@ SC消除reservation。SC即使miss也能进入MainPipe的s3，不申请MSHR。�
 四拍都用 valid、ready、fire。前一级 fire 才把结果写入后一级。后一级 ready 为 0 时，前一级停住。
 
 ### s0：选择请求并读 Tag、Meta
-+ 按 probe、refill、store、atomic 的顺序选一条。
-+ 用 `vaddr[13:6]` 和 s1、s2、s3 比 set。相同则本拍不 fire。
++ 按 probe、refill、store、atomic 的顺序。高优先级被自己的 set 挡住时，不冻结其它 set。
++ 和 s1、s2、s3 比 set。相同则这一条本拍不进。probe 用 `{tagAlias, 由地址还原的 index}`，其余用 `vaddr[13:6]`。
 + 算出哪些 bank 需要旧数据。probe、原子、replace 的脏行。部分 store 只读“被写到、但没有整 bank 覆盖”的 bank。
-+ store 是否真能参加仲裁，还要看 Data 口是不是正在被 load 使用。默认不等待；`force_write` 和等待阈值只作为性能旋钮，阈值 0 等于关闭。
++ 第一版不实现 `force_write`。store 不等 Load 让出 Data 口，等价于阈值 0。
 
 ### s1：比较、选 way、发数据读
 + 用物理地址比 4 个 tag，并丢掉 Meta 为 I 的 way。
 + 判断写权限：UC、UD 可写，SC、I 不可写。
-+ refill 先用命中 way。没有命中时，指定 way 必须已是 I；还没指定就选最小的 I way，否则只把 PLRU way 建议给 MissQueue，不在本条流水覆盖它。
++ refill 先用命中 way，不写回。未命中时，指定路已经是 I 就用它。否则用编号最小的 I 路。这些空位不写回。四路都仍有效时，在没被升级冻住、也没被 `replaceBlock` 跳过的路里选 PLRU；PLRU 那路不合法就选最小编号。被 `replaceBlock` 挡住的路记进 `skipVictim`，下一拍另选。一路都选不出来就不安装，只把 PLRU 建议给 MissQueue。
 + 需要旧数据时，按 bank mask 发 dataRead。每块 SRAM 吐出该 bank 的 4 路，后面只用选中的那一路。
 + 这一级不写 array，也不向 MissQueue 发请求。
 
 ### s2：分流
-+ store 或原子没有权限：发 missReq。能发出就结束，不进 s3。不能发出就停在 s2，必要时回 replay。
-+ 同地址 WritebackQueue 还没完成：missReq 不能发。
++ store 没有写权限：发 missReq。收下就离开，不进 s3。没收下，包括 `wbBlock` 和 `occupyFail`，走 `storeReplay`，等 Sbuffer 接住才离开 s2。
++ 原子除 SC 外没有写权限：发 missReq。`occupyFail` 或同地址已有 MSHR 走 `atomicReplay` 并离开。`wbBlock`，以及别的地址占满 MSHR，停在 s2 继续等。被收下后不回 `atomicResp`，等后来的 refill。
++ SC 即使 miss 也进 s3，不发 missReq。
++ 同地址 WritebackQueue 还没完成：missReq 不能发。store 因此 replay；原子停在 s2。
 + store、原子、probe、refill 需要继续改 array：等 s3 ready 后进入 s3。
 + refill 进入 s3 前，refillInfo 必须有效。没有整行数据不能进 s3。
 + 准备 byte 合并 mask。原子命中时不和 store 数据合并，s3 直接用读出的旧数据做运算。
 
 ### s3：提交
 + 拿到 dataResp 后完成合并、原子运算或整行安装。
-+ probe需要写回时，先握手 wbReq，再改 Meta。wbReq 没被收下，s3 停住。refill 不覆盖另一条仍有效的行。
-+ 写 Data、Meta、Tag。三项里哪些 ready 为 0，s3 就停住，请求保持不变。
-+ refill 写 Meta 前查 pending snoop。
-+ 给 Sbuffer、AtomicsUnit、ProbeQueue、MissQueue 中对应的一方回响应。
++ 要换出的旧行和新行的 PassDirty 或 WriteBackFull 共用一个 `wbReq`。先旧行，再新行。两笔都握手之前不改 Tag、Meta、Data。`error` 或最终 I 不安装，旧行留在 array 里。
++ 先等 `wbReq` 握手，再写 Data、Meta、Tag。哪一项 ready 为 0，s3 就停住，请求保持不变。
++ refill 写 Meta 前查 pending snoop。要求失效就不写 array，最终状态记成 I。
++ 数组写和 `wbReq` 都接住之后，才给 Sbuffer、AtomicsUnit、ProbeQueue 回响应。MissQueue 看 `mainpipeInfo` 完成那一拍的脉冲。
 + 命中写入或成功安装后更新 PLRU。
 + fire 后清除本级 valid。AMOALU 那一拍也算占用 s3，同 set 的 s0 继续被挡住。
 
+## 代码实现约定
 
+日期：2026-11-03。`wbReq` 不再使用只有地址和旧状态的 `MainPipeWbReq`。它的类型就是 `WriteBackReq`，和 `WriteBackQueue.req` 相同，以后顶层写 `wbq.io.req <> mainPipe.io.wbReq`。
+
+编号不要在 MainPipe 里再写一套。要改数字，只改 `src/main/scala/YQH/cache/WriteBackQueue/WriteBackQueue.scala` 里的 `WbOpcode` 和 `WbChiResp`。要改「哪种事务用哪个编号」，改 `MainPipe.scala` 里的 `wbOpcode`、`wbResp`、`wbPassDirty`。
+
+### 内部 opcode
+
+| 编号 | 名字 | MainPipe 何时使用 | 线上实际发出 |
+| --- | --- | --- | --- |
+| 0 | Evict | 换出干净的 SC 或 UC。不带数据，`passDirty=0` | TXEVT Evict |
+| 1 | WriteEvictFull | 不使用。`alwaysReleaseData` 关闭 | 不发 |
+| 2 | WriteBackFull | 换出的 UD，以及最终不再持有的脏行。`pendingInvalidate` 或共享 refill 上的非法 store 合并也走这条 | TXEVT WriteBackFull，数据拍 Resp=`I` |
+| 3 | SnpResp | Snoop 未命中，或命中但不需要数据 | TXRSP，txnId 用 `snpTxnId` |
+| 4 | SnpRespData | Snoop 命中且要带数据。失效时 UD 或 `needData`；降级、清脏时只有 UD | TXDAT 两拍，txnId 用 `snpTxnId` |
+| 5 | PassDirty | 共享且脏，并且这拍确实把行安装成 SC | TXEVT 仍是 WriteBackFull，数据拍 Resp=`SC_PD` |
+
+### Resp
+
+CHI Resp 不是本地 Meta。本地 UD 没有单独的 CHI 编号，脏用 `passDirty`。
+
+| 值 | 名字 | 含义 |
+| --- | --- | --- |
+| 0 | I | 不再持有 |
+| 1 | SC | 共享干净 |
+| 2 | UC | 独占干净。本地 UD 先映射成这个，再靠 passDirty 变成 UC_PD |
+| 4 | I_PD | 数据是脏的，最终不持有。Snoop 由 WriteBackQueue 在 Resp 上或进 bit2 |
+| 5 | SC_PD | 共享且脏责任已交出 |
+| 6 | UC_PD | 独占且脏 |
+
+Snoop 的 `resp` 填最终状态，不自己或上 PassDirty。旧行是 UD 时 `passDirty=1`，WriteBackQueue 再或上 4。第一版不做 tag 奇偶校验，`respErr` 恒为 0。
+
+四个 Snoop：
+
+| probeOp | 名字 | 命中后的状态 | 何时带数据 |
+| --- | --- | --- | --- |
+| 0 | SnpMakeInvalid | I | 从不带，UD 也不回 |
+| 1 | SnpToInvalid | I | UD，或者 `needData=1` |
+| 2 | SnpToShared | SC | 只有 UD，并置 `passDirty` |
+| 3 | SnpToClean | UD 变成 UC，其余不变 | 只有 UD，并置 `passDirty` |
+
+
+`MainPipeReq` 增加 `snpTxnId`。ProbeQueue 以后把 RXSNP 的编号放这里。MissQueue 的 refill 填 0。无数据的 Snoop 也走 `wbReq`，否则 TXRSP 没有发送者。`wbReq` 没被收下时，s3 不改 array，也不发 `probeResp`。

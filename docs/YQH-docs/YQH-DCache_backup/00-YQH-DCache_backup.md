@@ -89,7 +89,7 @@ Replay 只表示这一拍既没做完，也没被 MissQueue 接住。请求方�
 | --- | --- | --- |
 | 普通 load | 这一拍 `missReq`没被选中；MissQueue 拒绝；`wbBlock=1`；bank 冲突 | LoadUnit。还没做过 fast replay 的再走一遍 s0–s2，否则进 LoadQueue，以后再被选出来 |
 | store | 同样没被 MissQueue 接接，或权限升级时 `occupyFail=1` | Sbuffer 等 16 拍再送 MainPipe |
-| 原子 | 没被MissQueue接收。 | AtomicsUnit 回到 `s_cache_req`<br/> 再发，没有这 16 拍 |
+| 原子 | `occupyFail`，或同地址已经有 MSHR。`wbBlock` 和别的地址占满 MSHR 时停在 s2。refill 最终 I、error 或非独占也 replay | AtomicsUnit 收到 `atomicReplay` 后再发。独占做完走 `atomicResp` |
 | 软件预取 | 没被选中、被拒绝或 `wbBlock=1` | 不重发，直接丢掉 |
 
 
@@ -173,7 +173,7 @@ DCache不负责NC访存，需要走另一个通道，由上游进行分辨内存
 #### MetaArray
 由寄存器实现，位宽小，只需要2bit表示四种状态I,SC,UC,UD。
 
-每一个set中的每一个way都需要有meta信息，于是仅需要2 * 256 * 4 个寄存器。
+每一个set中的每一个way都需要有meta信息，于是仅需要2 * 256 * 4 个寄存器。读打一拍。三个读口给两条 LoadPipe 和 MainPipe，写口只有 MainPipe。同 set 同拍写时，被写的那一路 forward 进读响应，下一拍看到新 Meta。LoadPipe 不因此停住。
 
 
 

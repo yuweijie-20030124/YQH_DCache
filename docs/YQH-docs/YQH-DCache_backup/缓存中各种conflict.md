@@ -86,37 +86,41 @@ probe > refill > store > atomic
 
 s0 用 `vaddr[13:6]` 和 s1、s2、s3 比 set。任何一个相同，这一拍就不进。原因是 Tag、Meta、Data 的访问还没离开这几级，同一个 set 再插进来会读到写了一半的状态，或者抢同一个 SRAM 地址。
 
-s3 做 AMO 或 AMOCAS 时多出来的那一拍运算也算占用 s3。同 set 的新请求继续停在 s0。
+AMOALU 是组合逻辑，和写入在同一个 s3，不再多插一拍。s3 没完成握手之前仍占着这个 set，同 set 的新请求继续停在 s0。
 
 不同 set 不互相挡。probe 只比 set，不额外因为“有一笔 ReadShared 还没回来”而停住。
 
 # ③ TagArray 的读写端口冲突
-Tag 宽 34 bit，是 `paddr[47:14]`。一个 set 有 4 个 way，拆成 2 个 bank，每个 bank 放 2 个相邻 tag。
+物理 tag 宽 36 bit，是 `paddr[47:12]`。不用 34 bit 的 `paddr[47:14]`，否则同 set 里只有 `paddr[13:12]` 不同的两行会撞 tag。一个 set 有 4 个 way，拆成 2 个 bank，每个 bank 放 2 个相邻 tag。`tagWrite.vaddr` 仍是 34 bit，那是停用 WPU 留下的端口，Tag SRAM 不保存它。
 
 Tag进行多端口读写的方法是使用复制体，有多少个设备需要读就复制几份：2个loadpipe和1个mainpipe需要读tag，可以同时读互不等待。
 
 写只有 MainPipe s3 一个来源，同一拍只接受一个写。写的时候把所有复制体一起改掉。只改一份，其它流水会读到旧 tag。
 
-某个 tag bank 正在写时，所有复制体的这个 bank 都不能再当普通读。读要么停一拍，要么直接使用刚写进去的数据。不能读旧副本。
+某个复制体正在写时，这一拍的整次 set 读都停住，`read.ready` 为 0。不把刚写入的那一个 tag 转发进半次读。同一个 bank 里还有一个没被写的 tag，单端口 SRAM 读不出来。下一拍再读，看到的是新值。不能读旧副本。
 
 # ④ Meta 的写读冲突
 Meta 不用 SRAM，使用寄存器，因为位宽小，读口可以做多份。每个 set 的每个 way 一份，2 bit，状态只有 I、SC、UC、UD。总数是 `2 × 256 × 4`。
 
-读是组合逻辑读出后再打一拍。写是两级流水，并且要把新值 forward 给同一拍的读。
+读是组合逻辑读出寄存器，再打一拍。写口只有 MainPipe s3，`write.ready` 恒为 1，不是两级写流水。
 
-probe、refill、store、atomic 在 s0 都要读 Meta，因为 refill 这时还要认出 victim。这个 set 的写还没结束时，读让写，请求停在 s0。Data 正在写、而 refill 又要读有效 victim 时，refill 在 s1 多停一拍。这是两件不同的事，不要合成一个冲突。
+同 set、同一拍既写又读时，不是另发一条消息。被写的那一路在进响应寄存器之前换成新 Meta，其它路仍是旧值。下一拍 `resp` 看到新状态。三个读口都会这样旁路：`read(0)`、`read(1)` 是两条 LoadPipe，`read(2)` 是 MainPipe。
+
+MainPipe 有同 set 互锁，s3 在写的时候，自己的 s0 通常不会再读这个 set。真正会撞上的是 LoadPipe。LoadPipe 不因为 Meta 正在写而停住，下一拍用的是 forward 之后的新状态。没有这次旁路，它会把刚刚失效的行当成命中，或者 miss 掉刚刚装好的行。
+
+这和 Data 冲突不是一件事。MainPipe 在 s1 需要旧数据时，`dataRead` 没 ready 就停在 s1，不向 LSU replay。
 
 # ⑤ 回填进入 MainPipe 后的 set 冲突
 不再单设 RefillPipe，也不单设 replace 入口。load、store、软件预取和原子 miss 的回填都是 refill，优先级仅次于 probe。s1、s2 或 s3 已经有这个 set，新的 refill 就不能进 s0。
 
 因此取消以前的例外。以前 RefillPipe 可以在 MainPipe 过了 s1 之后写同 set 的另一路；现在没有第二条写流水，同 set 的任何 way 都要等这条 MainPipe 离开。不同 set 仍然互不相挡。
 
-原子指令第一次查找走 atomic。数据回来后不再进 atomic，改走 refill，和 load、store 用同一次 s3 换出 victim、写入新行。
+原子指令第一次查找走 atomic。数据回来后不再进 atomic，改走 refill。四路都有效时，这次 refill 在 s3 换出 victim：UD 发 WriteBackFull，干净的 SC/UC 发 Evict。没有合法 victim 时不安装，MissQueue 等 16 拍再试。
 
 # ⑥ WBQ block conflict
 这条物理行还在 WritebackQueue 里，新的 miss 不能再向 L2 索要
 
-WritebackQueue 里还有这个物理行时，新的 miss 不能发出。LoadPipe 在 s2 用块地址做 `wbq_conflict_check`。MainPipe 的 store、原子 miss 也做同样的检查。对上了就不要分配一笔会把这行再次要回来的请求。load 向 LSU 返回 replay。store 向 Sbuffer 返回 replay，这一拍不写成命中。
+WritebackQueue 里还有这个物理行时，新的 miss 不能发出。LoadPipe 在 s2 用块地址做 `wbq_conflict_check`。MainPipe 的 store、原子 miss 也做同样的检查。对上了就不要分配一笔会把这行再次要回来的请求。load 向 LSU 返回 replay。store 向 Sbuffer 返回 replay，这一拍不写成命中。写回还没离开时原子不 replay，停在 MainPipe 的 s2。`occupyFail` 或同地址已经有 MSHR 时才离开 s2。
 
 victim 不提前读出，也不 sleep。数据回来前，旧行仍在 array 里，load 和 store 直接命中 array。refill 的 s1 再读这份最新数据。s3 收下 WritebackQueue 之后就可以向下发 Evict 或 WriteBackFull，不等另一次回填来唤醒。同地址的新 miss 在这项离开 WritebackQueue 之前继续被挡住。
 
@@ -155,11 +159,11 @@ MSHR 满了，只有新地址会被拒绝。已经在里面的地址仍然可以
 | UD | 可以读 | 可以写 | 独占且脏 |
 
 
-store 看到 SC 或 I，由 MainPipe 把带数据和 mask 的 miss 交给 MissQueue，向 L2 要独占权限。整行覆盖用 MakeUnique，否则用 ReadUnique。数据回来并由 MainPipe 回填安装之后才是 UC 或 UD。
+store 看到 SC 或 I，由 MainPipe 把带数据和 mask 的 miss 交给 MissQueue，向 L2 要独占权限。整行覆盖用 MakeUnique，否则用 ReadUnique。数据回来并由 MainPipe 回填安装之后才是 UC 或 UD。refill 上合并了 store，并且 L2 给的是独占时，安装成 UD。共享 refill 上不允许带 store mask，出现则不安装。
 
 真正写入只发生在 MainPipe。UC 被 store 写过之后变成 UD。只是占住 MSHR，行还不是 UC。
 
-Snoop 可以在权限升级的中途把最终状态改掉。MSHR 要记下 pending snoop。回填写 Meta 之前再看一次。Snoop 要求失效，最终状态就是 I，不能因为原来的请求是 ReadShared 或 ReadUnique 就写成 SC、UC 或 UD。
+Snoop 可以在权限升级的中途把最终状态改掉。MSHR 要记下 pending snoop。回填写 Meta 之前再看一次。Snoop 要求失效，最终状态就是 I，不能因为原来的请求是 ReadShared 或 ReadUnique 就写成 SC、UC 或 UD。这一笔不写 Tag、Meta、Data。原来带下来的脏数据仍交给 WritebackQueue。
 
 L1 不保存 SD。共享并且 PassDirty 的数据先交给 WritebackQueue，再安装成 SC。不能为了少一次写回，把 SD 留在 Meta 里。
 

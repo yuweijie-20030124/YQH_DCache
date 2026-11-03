@@ -157,7 +157,7 @@ WriteBackEntry，共18条entry。
 | --- | --- | --- |
 | opcode | 3 | 内部编码：`Evict` / `WriteEvictFull` / `WriteBackFull` / `SnpResp` / `SnpRespData`。决定走哪条通道、带不带数据、要不要等完成 |
 | resp | 3 | 这笔事务结束后的 CHI 状态。主动写回恒为 `I`；snoop 来自 `probe_new_coh`，可以是 `I` / `SC` / `UC` / `UD` |
-| respErr | 2 | 控制 flit 的错误。正常是 `OK`；tag error 没有 data beat，用 `NDERR` |
+| respErr | 2 | 控制 flit 的错误。第一版不做 tag 奇偶校验，MainPipe 恒填 `OK` |
 | passDirty | 1 | 只给 `SnpRespData`。交出去的数据是脏的则为 1。主动写回的脏不脏已经在 opcode 里 |
 | snpTxnID | TxnIDBits | 进来的 SNP 的 TxnID。只有 `SnpResp` / `SnpRespData` 回填它。宽度跟链路定义走，不是 `log2(entry 数)` |
 | addr | 42 | 块地址。默认 `PAddrBits = 48`，块大小 64B，低 6 位恒为 0。冲突检查和 flit 地址都用它 |
@@ -220,4 +220,47 @@ passDirty
 空闲 -> 等数据写入 -> 停在这里，直到通道 opcode 冻结
 ```
 
+## 代码实现约定
 
+日期：2026-11-03。本节覆盖上文里冲突的句子，尤其是「共享且 PassDirty 的通道还没冻结，所以先不发送」。代码在 `src/main/scala/YQH/cache/WriteBackQueue/WriteBackQueue.scala`。目录名是 `WriteBackQueue`。没有接到 `DCache`，也没有改 MainPipe。`mill -i top.compile` 通过，并单独综合出了 Verilog。临时的 `WriteBackQueueGen` 已删除，避免和顶层 `App` 冲突。
+
+### 为什么共享且 PassDirty 仍发 WriteBackFull
+
+TXEVT 的 opcode 只有 1 bit：0 是 Evict，1 是 WriteBackFull。没有第三种 opcode，也没有 Resp 字段。共享且脏不能再等一个新 opcode。
+
+队列内部仍把这件事记成 `PassDirty=5`，避免和真正换出的脏行混在一起：
+
+- 换出的脏行，内部 opcode 是 `WriteBackFull=2`。线上 TXEVT 也是 WriteBackFull。后面两拍 `CopyBackWrData` 的 Resp 固定为 `I=0`。含义是这份脏数据交出后，L1 不再持有旧行。新行状态由同一次 refill 安装。
+- 共享且 PassDirty，内部 opcode 是 `PassDirty=5`。线上 TXEVT 仍然是 WriteBackFull，因为只有这一个能带数据的 EVT。区别在数据拍：Resp 固定为 `SC_PD=5`。含义是脏责任已经交出，但 L1 还把这行安装成 SC，不安装 SD。
+
+DBID 到了才发这两拍。只拿到 DBID 不释放；完成可以比数据先到，数据发完且完成已到才释放。
+
+### 为什么不接 MainPipe 现有的 wbReq
+
+MainPipe 现在的 `wbReq` 只有地址、整行数据、`passDirty` 和旧一致性状态。没有 opcode、Resp、`respErr`、`snpTxnId`。Snoop 应答和 CMO 写回表达不出来。本模块用自己的 `WriteBackReq`。接到 MainPipe 要改它的请求口，这一版不做。
+
+### 通道和资源
+
+- 18 项。Evict、WriteBackFull、PassDirty 的 TXEVT.txnId = 17 + 项号，范围 17～34。
+- Snoop 应答带回原来的 `snpTxnId`，不占 17～34。无数据走本模块准备好的 TXRSP；有数据走 TXDAT，txnId 仍是 Snoop 号，不用 DBID。
+- 没有 Credit / Retry。`txRsp` 只准备无数据 SnpResp，和 MissQueue 的 CompAck 由顶层仲裁。本模块不看仲裁结果以外的事：自己的 `txRsp` 没 fire 就保持同一项。
+- 同物理行已有项，或者 18 项已满，或者 opcode 不认识，`req.ready=0`。`WriteEvictFull` 不收，`alwaysReleaseData` 关闭。
+- 地址按 64B 对齐后保存。TXEVT.addr 是 48 bit 行地址，低 6 位为 0。这跟后来接受的 Compact CHI 一致：EVT 48 bit，只有 SNP 仍是 45 bit。
+- 项内保存 512 bit。TXDAT 每拍 256 bit，`dataID=0` 是低半行，`dataID=1` 是高半行。`byteEnable` 是 32 bit，第一版全 1。
+- `traceTag`、`ns`、`memAttr`、`wayValid`、`way` 第一版发 0。目标节点用 `l2NodeId`。请求口没有 Snoop 的 srcID，所以 SnpResp 的 tgtID 也先固定为 L2。CopyBack 见到 RXRSP 之后，TXDAT 的 tgtID 改用该响应的 srcID。
+- 数据在收下的当拍写入寄存器，下一拍才可见。`dataReady` 和 `busy` 同时变 1，不会再多等一拍。通道 `valid` 期间用 hold 锁住项号，ready 为 0 时不改 payload，两拍数据之间可以有气泡，但不能换成另一项。
+
+### 释放
+
+| 种类 | 释放 |
+| --- | --- |
+| Evict | TXEVT 已被收下，并且 RXRSP 是 Comp 或 CompDBIDResp。单独的 DBIDResp 不释放 |
+| WriteBackFull、PassDirty | 两拍 TXDAT 已发出，并且完成已到 |
+| SnpResp | TXRSP fire 的下一拍。不等 RXRSP |
+| SnpRespData | 第二拍 TXDAT fire 的下一拍。不等 RXRSP |
+
+`blockQuery` 有四路，依次是 LoadPipe0、LoadPipe1、MainPipe、CMO。同物理行还有项时对应的 `block` 为 1。`wfi.safe` 只表示这 18 项都空，不看 `wfi.req`。顶层还要再与上 MissQueue 和 ProbeQueue。
+
+RXRSP 只接 txnId 17～34，而且该项必须还在等 EVT 响应。别的编号由顶层送给 MissQueue 或 CMO。对不上就视为协议错误。
+
+Entry 不是子模块，状态在队列里更新。

@@ -10,7 +10,7 @@
 | <font style="color:#000000;">nReleaseEntries</font> | <font style="color:#000000;">18</font> | <font style="color:#000000;">WritebackQueue 必须比 MissQueue 多。MissQueue 不保存写回数据</font> |
 | <font style="color:#000000;">blockBytes</font> | <font style="color:#000000;">64</font> | <font style="color:#000000;">一项持有一整行。RXDAT 每拍 32B，分两拍收齐</font> |
 | <font style="color:#000000;">alias</font> | vaddr[13:12] | <font style="color:#000000;">和物理行地址一起比较。不同 alias 不合并</font> |
-| <font style="color:#000000;">Tag</font> | <font style="color:#000000;">34 bit</font> | <font style="color:#000000;">padder[47:14], MissQueue 不读 Tag SRAM</font> |
+| <font style="color:#000000;">Tag</font> | <font style="color:#000000;">36 bit</font> | <font style="color:#000000;">paddr[47:12]。不用 34 bit 的 paddr[47:14]。MissQueue 不读 Tag SRAM</font> |
 | <font style="color:#000000;">CMO txnId</font> | <font style="color:#000000;">第16</font> | <font style="color:#000000;">CMO 不占 16 个 MissEntry。WritebackQueue 的 txnId 不得使用 0～15，占用第16</font> |
 
 
@@ -199,3 +199,35 @@ load要发来的数据（一拍32B）的哪一拍根据load的地址第五<font 
 4.snoop_done
 
 都为1的时候才能释放MSHR。
+
+## 代码实现约定
+
+文件：`src/main/scala/YQH/cache/MissingQueue/MissQueue.scala`。还没有接到顶层 DCache。
+
+和上文冲突时，以这里为准。
+
+- 入口仲裁不在 MissQueue 里。`MissArb` 的 0、1、2 号口分别是 MainPipe、LoadPipe0、LoadPipe1，编号小的优先。没选中的口 `ready=0`。
+- `missReq.ready` 恒为 1。接不下来时 `handled=0`，请求方自己重发。`wbBlock=1` 或 `cancel=1` 时不分配、也不合并。
+- 同一物理行、同一 alias 才合并。合并客户最多 8 个，`client_id` 用现有的 6 bit。满了就拒绝，不为同一行再分配一项。
+- `TXREQ.valid` 已经拉高后，opcode、地址、alias 不能改。这时后到的 store 或 `prefetch.w` 不能把 ReadShared 升级成 ReadUnique。已经是 ReadUnique 或 MakeUnique、并且 refill 还没发出，仍然可以合并。
+- 软件预取的 `expCompStash=1`。`CompStash` 和 `l2Hint` 只记在项里，不据此发数据和 refill。
+- ReadShared、ReadUnique 必须两拍 RXDAT 都到才 `data_done`。权限升级如果只回 Comp、不回数据，这一项继续等，不把 Comp 当成完成。MakeUnique 没有数据，Comp、DBIDResp 或 CompDBIDResp 才 `data_done`。
+- `RXDAT.ready` 恒为 1。`RXRSP` 只接收 txnId 0～15 和正在等的 CMO 16，不接收 WritebackQueue 的 17～34。
+- 同一项同时只发一条 refill。`installed` 或最终状态 I 才是 `refill_done`。四路都有效、没装上时置 `waitVictim`，16 拍后再试一次，避免占死 refill 口。
+- Snoop 要降成 SC、并且 buffer 里已经有 store 字节时，refill 不再带 store mask，改成 `passDirty`。否则 MainPipe 会断言共享 refill 不能合并 store。
+- 安装成 SC、UC 或 UD 时给 load 发 `refillWakeup`。最终是 I 时不发这条，改发 `loadReplay`，load 按 miss 重来。store 安装成功走 `storeDone`，放弃安装走 `storeReplay`。这两个口都不是 MainPipe 的 `storeHit`。
+- 原子不合并。`missResp.sameAddr` 在请求有效、匹配到项、又不能合并时为 1。同地址已有 MSHR 时 MainPipe 发 `atomicReplay`，不再停死在 s2。别的地址占满，或被 WritebackQueue 挡住，仍然停在 s2 再试。
+- 原子 refill 最终是 I、`error`，或装成非独占时，MainPipe 在 s3 发 `atomicReplay`，不回 `atomicResp`。MSHR 仍按 `finalCoh=I` 或安装成功结束。没有合法 victim 时不 replay，置 `waitVictim`，16 拍后再送同一条 refill。
+
+- `wfi.safe` 只表示 16 个 MSHR 和 CMO 都空闲。WritebackQueue、ProbeQueue 由顶层再与上。
+- CMO 的 opcode 就是 Compact CHI 的 CleanShared、CleanInvalid、MakeInvalid。zero 不是 CMO。
+
+### 原子没做成时谁来结束
+
+日期：2026-11-03。以前这里写的两个缺口已经补上。原子客户仍然不参与 `canFree`。完成号放在 refill 的 `id` 上，由 MainPipe 回 `atomicResp` 或 `atomicReplay`。
+
+最终 I 或 `error`：不安装。`finalCoh=I`，`refill_done` 可以置 1。MainPipe 不把这行装成有效，s3 发 `atomicReplay`。load 仍走 `loadReplay`，store 仍走 `storeReplay`。
+
+降成 SC：行可以装成 SC，`retUnique=0`。LR、CAS、ALU 没有独占权限，MainPipe 发 `atomicReplay`，不在共享行上做完。
+
+同地址已有项：`allowMerge` 不包含原子，`allowAlloc` 又要求没有匹配项，所以 `handled` 保持 0。同时 `sameAddr=1`。MainPipe 看到后走 `atomicReplay`，s2 离开，不再挡住这条 refill。`wbBlock` 时不发 miss，`sameAddr` 的 replay 条件也不成立。
