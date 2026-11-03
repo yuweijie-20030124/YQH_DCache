@@ -82,8 +82,9 @@ class DCacheLineReq(implicit p: DCacheParameters) extends DCacheBundle {
   val cmd    = UInt(M_SZ.W)
   val vaddr  = UInt(VAddrBits.W)
   val addr   = UInt(PAddrBits.W)
-  // val data   = UInt((cfg.blockBytes * 8).W)
-  // val mask   = UInt(cfg.blockBytes.W)
+  // Sbuffer 提交整行。mask 的 1 表示这个字节要写。
+  val data   = UInt((blockBytes * 8).W)
+  val mask   = UInt(blockBytes.W)
   val id     = UInt(reqIdWidth.W)
 }
 
