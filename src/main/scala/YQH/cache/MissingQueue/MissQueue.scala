@@ -207,7 +207,9 @@ class MissReqWithOutStoreData(implicit p: DCacheParameters) extends DCacheBundle
   val amo_cmp = UInt(QuadWordBits.W)
   val req_coh = new MetaData
   val id = UInt(reqIdWidth.W)
-  val isBtoT = Bool()
+  // 行已经在 SC，要升到 Unique。Compact CHI 没有 BtoT。
+  // 部分写、原子和写预取发 ReadUnique；整行覆盖仍发 MakeUnique。命中的 way 不能换。
+  val scToUnique = Bool()
   val occupy_way = UInt(nways.W)
   val cancel = Bool()
 
@@ -379,7 +381,7 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
   io.missResp.sameAddr := io.missReq.valid && matched && !allowMerge
 
   val allocOp = Mux(req.isFromStore && req.full_overwrite, CompactChiOpcode.Req.MakeUnique,
-    Mux(req.isFromStore || req.isFromAMO || isPfw || req.isBtoT,
+    Mux(req.isFromStore || req.isFromAMO || isPfw || req.scToUnique,
       CompactChiOpcode.Req.ReadUnique, CompactChiOpcode.Req.ReadShared))
 
   val dat = io.rxDat.bits
@@ -716,8 +718,8 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
       e.vaddr := req.vaddr
       e.pc := req.pc
       e.alias := reqAlias
-      e.isUpgrade := req.isBtoT
-      e.way := Mux(req.isBtoT, req.occupy_way, 0.U)
+      e.isUpgrade := req.scToUnique
+      e.way := Mux(req.scToUnique, req.occupy_way, 0.U)
       e.stash := isPrefetchReq
       e.amoData := req.amo_data
       e.amoMask := req.amo_mask
@@ -902,8 +904,8 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
   assert(!io.missReq.valid || PopCount(matchVec.asUInt) <= 1.U,
     "one in-flight miss per physical line and alias")
   assert(PopCount(entries.map(_.refillInflight)) <= 1.U, "only one refill may be in MainPipe")
-  assert(!allowAlloc || !req.isBtoT || PopCount(req.occupy_way) === 1.U,
-    "permission upgrade must name exactly one way")
+  assert(!allowAlloc || !req.scToUnique || PopCount(req.occupy_way) === 1.U,
+    "SC to Unique must name exactly one way")
   assert(!io.cmoReq.fire || io.cmoReq.bits.opcode === CmoOpcode.CLEAN ||
     io.cmoReq.bits.opcode === CmoOpcode.FLUSH || io.cmoReq.bits.opcode === CmoOpcode.INVAL,
     "CMO opcode must be CleanShared, CleanInvalid or MakeInvalid")

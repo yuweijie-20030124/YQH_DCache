@@ -174,7 +174,7 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
   io.miss_req.bits.amo_cmp := 0.U
   io.miss_req.bits.req_coh := s2_meta
   io.miss_req.bits.id := s2_req.id
-  io.miss_req.bits.isBtoT := s2_upgrade
+  io.miss_req.bits.scToUnique := s2_upgrade
   io.miss_req.bits.occupy_way := Mux(s2_upgrade, s2_way_en, 0.U)
   io.miss_req.bits.cancel := false.B
   io.miss_req.bits.store_data := 0.U

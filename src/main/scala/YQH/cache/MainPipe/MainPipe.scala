@@ -530,7 +530,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   io.missReq.bits.amo_cmp := s2_hold.amoCmp
   io.missReq.bits.req_coh.coh := Mux(s2_hit, s2_coh, MetaState.I)
   io.missReq.bits.id := s2_hold.id
-  io.missReq.bits.isBtoT := s2_upgrade
+  io.missReq.bits.scToUnique := s2_upgrade
   io.missReq.bits.occupy_way := Mux(s2_upgrade, UIntToOH(s2_way), 0.U)
   io.missReq.bits.cancel := false.B
   io.missReq.bits.store_data := s2_hold.storeData
