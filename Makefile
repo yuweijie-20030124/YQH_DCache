@@ -12,6 +12,7 @@
 #    make lint               生成 + 检查产物非空
 #    make sim / make run     构建 / 运行 verilator 仿真
 #    make srun               sim + run
+#    make gtk                用 GTKWave 打开 logs/ 里的波形
 #    make clean              删除 build/ 和 logs/
 #    make clean_mill         删除 out/（mill 输出）
 #    make help               显示帮助
@@ -37,13 +38,16 @@ TOP_V     := $(RTL_DIR)/$(TOPNAME).v
 
 # ------------------------------------------------------------------ 源文件 --
 SCALA_FILES := $(shell find src/main -name '*.scala')
-CSRCS       := $(if $(wildcard sim_c),$(shell find $(abspath sim_c) -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \)),)
+# 激励在 sim/src，不再使用 sim_c。
+CSRCS       := $(shell find $(abspath sim/src) -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) 2>/dev/null)
 
 # ------------------------------------------------------------------ 工具 --
-VERILATOR ?= verilator
+VERILATOR ?= /usr/local/bin/verilator
 
 # ------------------------------------------------------------------ Verilator 参数 --
-VERILATOR_FLAGS ?= -Wall -MMD --trace --build -cc --exe \
+# Chisel 的 SyncReadMem 会留下 mem_*_MPORT_en，赋值后没有读者。
+# 这是 FIRRTL 拆 bank 的产物，不是端口悬空。-Wall 会把它当成错误。
+VERILATOR_FLAGS ?= -Wall -Wno-UNUSEDSIGNAL -MMD --trace --build -cc --exe \
                    -O3 --x-assign fast --x-initial fast --noassert \
                    -report-unoptflat --timescale 1us/1us
 
@@ -77,6 +81,7 @@ sim: $(CSRCS) verilog
 	  --Mdir $(OBJ_DIR) -o $(abspath $(SIM_BIN))
 
 run:
+	@mkdir -p logs
 	@echo
 	@echo "------------ RUN --------------"
 	$(SIM_BIN)
@@ -89,23 +94,29 @@ endif
 srun: sim run
 
 # 只激励 storebuffer 的一笔 store，生成 logs/store-txreq.vcd。不改 DCache RTL。
-STORE_RTL := $(BUILD_DIR)/verilog-store
+# 激励在 sim/src/main.cpp，顶层就是 DCache，不再例化测试模块。
 STORE_OBJ := $(BUILD_DIR)/OBJ_STORE
 STORE_BIN := $(BUILD_DIR)/store-txreq
-store-sim:
-	@mkdir -p $(STORE_RTL) logs
-	mill -i sim.runMain sim.storeTbMain -td $(STORE_RTL) --emit-modules verilog
+store-sim: verilog
+	@mkdir -p logs
 	@rm -rf $(STORE_OBJ)
 	$(VERILATOR) -Wno-fatal -Wno-WIDTH -Wno-UNUSED -Wno-UNOPTFLAT -Wno-PINCONNECTEMPTY \
 	  -Wno-DECLFILENAME -Wno-TIMESCALEMOD -MMD --trace --build -cc --exe -O1 \
 	  --x-assign unique --x-initial unique --timescale 1ns/1ns \
-	  -top StoreOnlyTb $(abspath sim/store_txreq/main.cpp) $(wildcard $(STORE_RTL)/*.v) \
+	  -top $(TOPNAME) $(abspath sim/src/main.cpp) $(wildcard $(RTL_DIR)/*.v) \
 	  --Mdir $(STORE_OBJ) -o $(abspath $(STORE_BIN))
 	$(STORE_BIN)
 
+# 仿真把波形写到 logs/store-txreq.vcd。make gtk 直接打开。
+GTKWAVE ?= gtkwave
+WAVE    ?= logs/store-txreq.vcd
+
+gtk:
+	@test -s "$(WAVE)" || { echo "[make] 没有波形：$(WAVE)。先 make srun" >&2; exit 1; }
+	$(GTKWAVE) "$(WAVE)" ~/.gtkwaverc &
 
 # ------------------------------------------------------------------ 清理 --
-clean:
+clean: 
 	-rm -rf $(BUILD_DIR) logs
 
 clean_mill:
@@ -120,9 +131,10 @@ help:
 	@echo "sim        用 verilator 构建 $(SIM_BIN)"
 	@echo "run        运行 $(SIM_BIN)"
 	@echo "srun       sim + run"
+	@echo "gtk        用 GTKWave 打开 $(WAVE)"
 	@echo "store-sim  一笔 store，波形 logs/store-txreq.vcd"
 	@echo "clean      删除 $(BUILD_DIR)/ 和 logs/"
 	@echo "clean_mill 删除 out/"
 	@echo "help       显示本帮助"
 
-.PHONY: verilog lint sim run srun store-sim clean clean_mill clean_all help
+.PHONY: verilog lint sim run srun gtk store-sim clean clean_mill clean_all help

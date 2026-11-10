@@ -34,23 +34,4 @@ object top extends ScalaModule {
 
 }
 
-object sim extends ScalaModule {
-  def scalaVersion = "2.12.18"
-  override def millSourcePath = build.millSourcePath / "sim"
-  override def moduleDeps = Seq(top)
-  override def ivyDeps = Agg(
-    ivy"edu.berkeley.cs::chisel3:3.6.1"
-  )
-  override def scalacPluginIvyDeps = Agg(
-    ivy"edu.berkeley.cs:::chisel3-plugin:3.6.1"
-  )
-  def scalacOptions = T {
-    super.scalacOptions() ++ Seq(
-      "-language:reflectiveCalls",
-      "-deprecation",
-      "-feature",
-      "-Xcheckinit"
-    )
-  }
-}
 
