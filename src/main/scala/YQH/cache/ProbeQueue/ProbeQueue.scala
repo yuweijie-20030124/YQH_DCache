@@ -121,7 +121,7 @@ class ProbeQueue(implicit p: DCacheParameters) extends DCacheModule {
   def toReq(e: ProbeEntry, idx: UInt): MainPipeReq = {
     val req = Wire(new MainPipeReq)
     req.cmd := 0.U
-    req.vaddr := Cat(0.U((VAddrBits - 14).W), e.tagAlias, e.addr(11, 0))
+    req.vaddr := vaddrFromAlias(e.tagAlias, e.addr)
     req.addr := e.addr
     req.tagAlias := e.tagAlias
     req.id := idx.pad(reqIdWidth)

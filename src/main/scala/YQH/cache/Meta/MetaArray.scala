@@ -18,10 +18,10 @@ class MetaWriteReq(implicit p: DCacheParameters) extends MetaReadReq {
 // Meta stae
 
 object MetaData {
-  def INVALID      = 0.U(2.W)
-  def SHARED_CLEAN = 1.U(2.W)
-  def UNIQUE_CLEAN = 2.U(2.W)
-  def UNIQUE_DIRTY = 3.U(2.W)
+  def INVALID      = 0.U(2.W) //00 invalid
+  def SHARED_CLEAN = 1.U(2.W) //01 shared clean
+  def UNIQUE_CLEAN = 2.U(2.W) //10 unique clean
+  def UNIQUE_DIRTY = 3.U(2.W) //11 unique dirty
 }
 class MetaData(implicit p: DCacheParameters) extends DCacheBundle {
   val coh = UInt(2.W) // I0 SC1 UC2 UD3

@@ -42,7 +42,7 @@
 | <font style="color:#000000;">way占用</font> | <font style="color:#000000;"></font> | <font style="color:#000000;">权限升级要occupy占用way</font> |
 | <font style="color:#000000;">occupySet</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">loadpipe和mainpipe会访问的set</font> |
 | <font style="color:#000000;">occupyWay</font> | <font style="color:#000000;">out</font> | <font style="color:#000000;">这个set已经占用的way</font> |
-| <font style="color:#000000;">occupyFail</font> | <font style="color:#000000;">out</font> | <font style="color:#000000;">占用失败</font> |
+| <font style="color:#000000;">occupyFail</font> | <font style="color:#000000;">out</font> | <font style="color:#000000;">同一个 set 上，不同 way 的在途权限升级已经多于 nWays-2。按路计，不按项计</font> |
 | //DCache<>L2 |  |  |
 | <font style="color:#000000;">TXREQ</font> | <font style="color:#000000;">out</font> | <font style="color:#000000;">ReadShared、ReadUnique、MakeUnique，以及 CMO。</font>`<font style="color:#000000;">size</font>`<font style="color:#000000;"> </font><font style="color:#000000;">固定为 6</font> |
 | <font style="color:#000000;">RXDAT</font> | <font style="color:#000000;">in</font> | <font style="color:#000000;">CompData。</font>`<font style="color:#000000;">dataId=0</font>`<font style="color:#000000;"> </font><font style="color:#000000;">是低 32B，</font>`<font style="color:#000000;">dataId=1</font>`<font style="color:#000000;"> </font><font style="color:#000000;">是高 32B。两拍不保证按 0、1 的顺序来</font> |

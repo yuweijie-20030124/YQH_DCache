@@ -220,6 +220,7 @@ class DCache(implicit p:DCacheParameters) extends DCacheModule {
   val wb = Module(new WriteBackQueue)
   val probe = Module(new ProbeQueue)
 
+  // 两条loadpipe
   for (i <- 0 until loadPipelineWidth) {
     val ld = loads(i).io
     ld.lsu <> io.load(i)

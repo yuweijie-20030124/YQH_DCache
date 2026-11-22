@@ -16,7 +16,9 @@
 
 **s2:**
 
-在s2阶段，拿从s1中判断的出的miss/hit结果和一致性结果，发Missreq请求 或 发hit数据给LoadUnit，更新replace状态。  
+在s2阶段，拿从s1中判断的出的miss/hit结果和一致性结果，发Missreq请求 或 发hit数据给LoadUnit，更新replace状态。
+
+s2 只活一拍，不因 LSU 没接住响应而停住。`resp.ready` 必须为 1。不允许把 hit、replay、handled 和 mshr id 锁存后再等下一拍。停住再算会把同一条 load 再次送进 MissQueue。这与香山昆明湖一致：`s2_ready` 恒为真，并断言 `lsu should be ready in s2`，流水线本身不被 s1/s2 堵住。s0 仍可能因为 Tag 写口没就绪而停住。本地约定，2026-11-16。
 
 
 ## LoadPipe接口
@@ -52,7 +54,7 @@
 
 
 ### 权限升级取消
-LoadPipe如果要申请UC权限(SC的情况下写预取)，需要向MissQueue申请MSHR。如果说 同一个set的所有way在权限升级中，会导致如果后续产生了miss，由于权限升级不能有victim，于是不能替换出去。于是香山的做法就是同一个set中最多只能有way-1条升级权限请求能成功，真miss的时候就能选中这条way作为victim。
+LoadPipe如果要申请UC权限(SC的情况下写预取)，需要向MissQueue申请MSHR。如果说 同一个set的所有way在权限升级中，会导致如果后续产生了miss，由于权限升级不能有victim，于是不能替换出去。于是香山按路计，不按 MSHR 项计：各路 one-hot 按位或之后，已经占用的路数大于 nWays-2（4 路时是已经有 3 路）就拒绝。两项挤在同一路只算一路。真 miss 的时候就能选中剩下那路作为 victim。
 
 
 

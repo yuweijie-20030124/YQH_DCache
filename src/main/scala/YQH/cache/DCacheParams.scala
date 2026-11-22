@@ -24,10 +24,9 @@ case class DCacheParameters(
 
     // bank
     nBanks       :Int = 8    ,
-    // 物理 tag 是 paddr[47:12]，36 bit。必须带上 paddr[13:12]：
-    // set index 的高两位是虚拟别名，不是物理地址。若只存 paddr[47:14]，
-    // 同 set 内仅 [13:12] 不同的两行会得到相同 tag。
-    // vtagBits 只留给已停用的 WPU，当前不参与命中判断。
+    // 物理 tag 从页偏移开始。set index 高出页偏移的位是虚拟别名，
+    // 不是物理地址；tag 必须保留对应的物理位，否则同 set 内只差别名的
+    // 两行会得到相同 tag。vtagBits 只留给已停用的 WPU，当前不参与命中判断。
     tagBits     :Int = 48-12 ,
     vtagBits    :Int = 48-14 ,
 
@@ -42,9 +41,8 @@ case class DCacheParameters(
     dcacheNodeId:Int = CompactChiUpstreamNodeId.DCache,
     l2NodeId:Int = 0,
 
-    // L1↔L2 的字段宽度用 Compact-CHI 的 CompactChiParams。
-    // tagAliasBits 不跟库的默认 1。256 set 的 index 含 vaddr[13:12]，必须是 2。
-    chi: CompactChiParams = CompactChiParams(tagAliasBits = 2),
+    // 4 KiB 页。TagAlias 是 set index 里高出这个页偏移的部分。
+    pageOffsetBits:Int = 12,
 
     //OUTSIDE (SoC / Core设置)
     PAddrBits   :Int  = 48  ,
@@ -53,6 +51,15 @@ case class DCacheParameters(
     reqIdWidth  :Int  = 5,
 
 ) {
+  // TagAlias 位数不能写在 chi 的默认参数里：Scala 默认参数引用不到前面的字段。
+  // 当前 64B 行、256 set、4KiB 页得到 2，也就是 vaddr[13:12]。
+  val tagAliasBits: Int = {
+    val raw = log2Ceil(blockBytes) + log2Ceil(nSets) - pageOffsetBits
+    if (raw > 0) raw else 0
+  }
+  // L1↔L2 的其余字段仍用 Compact-CHI 默认值，只有别名宽度跟着 cache 配置走。
+  val chi: CompactChiParams = CompactChiParams(tagAliasBits = tagAliasBits)
+
   // way 位宽不在 CompactChiParams 里。库的约定是按路数传入索引宽度：八路为 3，四路为 2。
   val chiWayBits: Int = log2Ceil(nWays)
 
@@ -62,12 +69,15 @@ case class DCacheParameters(
   require(nReleaseEntries > nMissEntries)
   require(LoadPipelineWidth == 2)
   require(!alwaysReleaseData)
-  require(PAddrBits == 48 && tagBits == PAddrBits - 12)
+  require(PAddrBits == 48 && tagBits == PAddrBits - pageOffsetBits)
   require(dcacheNodeId == CompactChiUpstreamNodeId.DCache && l2NodeId >= 0)
   require(chi.addrBits == PAddrBits)
   require(chi.dataBits == 256 && chi.dataBytes * 2 == blockBytes)
   require(chi.snoopAddrBits == PAddrBits - 3)
-  require(chi.tagAliasBits == 2)
+  require(pageOffsetBits >= log2Ceil(blockBytes),
+    "page offset must cover the cache-line offset")
+  require(chi.tagAliasBits == tagAliasBits,
+    "Compact-CHI tagAliasBits must match the cache geometry")
   require(chiWayBits == 2 && (1 << chiWayBits) == nWays)
 }
 
@@ -98,9 +108,14 @@ trait HasDCacheParameters{
   // cacheline / tag 地址划分
   def idxBits = log2Up(p.nSets)
   def untagBits = blockOffBits + idxBits
-  // 与 XiangShan 的 HasL1CacheParameters 一致：4 KiB 页内地址不参与物理 tag。
-  def pgIdxBits = 12
+  // 与 XiangShan 的 HasL1CacheParameters 一致：页内地址不参与物理 tag。
+  def pgIdxBits = p.pageOffsetBits
   def pgUntagBits = untagBits min pgIdxBits
+  // set index 整个落在页内时没有虚拟别名。当前 64B 行、256 set、4KiB 页是 2 位。
+  def tagAliasBits: Int = {
+    val raw = untagBits - pgIdxBits
+    if (raw > 0) raw else 0
+  }
   val nMissEntries  = p.nMissEntries
   val nProbeEntries = p.nProbeEntries
   val nReleaseEntries = p.nReleaseEntries
@@ -172,6 +187,17 @@ trait HasDCacheParameters{
     addr(untagBits - 1, blockOffBits)
   }
 
+  // 从虚地址取出 TagAlias。位数和位置都由行大小、set 数、页偏移决定。
+  // 当前配置是 vaddr[13:12]；set 变少到整段 index 都在页内时，结果是 0。
+  def get_tag_alias(vaddr: UInt): UInt = {
+    if (tagAliasBits == 0) {
+      0.U(chi.tagAliasBits.W)
+    } else {
+      require(vaddr.getWidth >= pgIdxBits + tagAliasBits)
+      vaddr(pgIdxBits + tagAliasBits - 1, pgIdxBits)
+    }
+  }
+
   // 物理 tag 的切分方式与 XiangShan 一致：paddr >> pgUntagBits。
   // 当前配置等价于 paddr(47, 12)，宽度为 tagBits = 36。
   def get_phy_tag(addr: UInt): UInt = {
@@ -193,12 +219,34 @@ trait HasDCacheParameters{
     Cat(snoopAddr(chi.snoopAddrBits - 1, 0), 0.U(3.W))
   }
 
-  // 线上还原 set：{tagAlias, addr[11:6]}。tagAlias 固定 2 bit，结果是 8 bit，对应 256 set。
+  // 用 TagAlias 和物理地址还原 set。页内 index 来自物理地址，高出页偏移的部分用 alias。
+  // 结果宽度是 idxBits。当前配置等价于 {tagAlias, addr[11:6]}。
   def dcacheSet(tagAlias: UInt, byteAddr: UInt): UInt = {
-    val aliasBits = chi.tagAliasBits
-    require(byteAddr.getWidth >= 12 && tagAlias.getWidth >= aliasBits)
-    if (aliasBits == 0) byteAddr(11, 6)
-    else Cat(tagAlias(aliasBits - 1, 0), byteAddr(11, 6))
+    val aliasBits = tagAliasBits
+    val inPageBits = pgIdxBits - blockOffBits
+    require(chi.tagAliasBits == aliasBits)
+    require(byteAddr.getWidth >= untagBits)
+    if (aliasBits == 0) {
+      byteAddr(untagBits - 1, blockOffBits)
+    } else {
+      require(tagAlias.getWidth >= aliasBits && inPageBits >= 0)
+      if (inPageBits == 0) tagAlias(aliasBits - 1, 0)
+      else Cat(tagAlias(aliasBits - 1, 0), byteAddr(pgIdxBits - 1, blockOffBits))
+    }
+  }
+
+  // 只恢复查 set 需要的低位虚地址：{0, tagAlias, page offset}。
+  def vaddrFromAlias(tagAlias: UInt, byteAddr: UInt): UInt = {
+    require(byteAddr.getWidth >= pgIdxBits)
+    val page = byteAddr(pgIdxBits - 1, 0)
+    if (tagAliasBits == 0) {
+      Cat(0.U((VAddrBits - pgIdxBits).W), page)
+    } else {
+      val high = VAddrBits - pgIdxBits - tagAliasBits
+      require(tagAlias.getWidth >= tagAliasBits && high >= 0)
+      if (high == 0) Cat(tagAlias(tagAliasBits - 1, 0), page)
+      else Cat(0.U(high.W), tagAlias(tagAliasBits - 1, 0), page)
+    }
   }
 
   def get_tag(addr: UInt): UInt = get_phy_tag(addr)

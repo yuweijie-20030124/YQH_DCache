@@ -1,6 +1,6 @@
 # DCache 验证环境模块契约
 
-状态：Draft
+状态：2026-11-17 修订；首轮 Load 迁移已实现并验证，CMO 与真实 L2 仍为后续计划。
 
 本文记录各模块的初始职责和边界。具体字段在实现某个模块前单独确认，不在本文中提前冻结全部代码接口。
 
@@ -31,7 +31,7 @@
 - 处理宽位信号的拆分和拼接；
 - 集中维护 `VDCache` 端口名称的适配细节。
 
-不实现 CPU、L2 或 scoreboard 的行为逻辑。
+不实现 CPU、L2 或测试的行为逻辑。
 
 ## 2. `simCPU`
 
@@ -40,7 +40,7 @@
 负责：
 
 - 维护 CPU 操作队列；
-- 驱动两条 Load lane、Store 和 Atomic 接口；
+- 当前驱动两条 Load lane；后续独立接入 CmoModel，再按需扩展 Store/Atomic；
 - 处理请求握手；
 - 区分 hit、miss/handled、refillWakeup、loadReplay 和最终完成；
 - 正常安装成功的 miss 在 `refillWakeup` 握手后重新发起 Load；
@@ -57,13 +57,13 @@
 
 负责生成一个测试需要的 CPU 操作序列和场景参数。
 
-第一版只生成 `single_load_miss` 的一个 Load。
+已有首版只生成 `single_load_miss` 的一个 Load。后续每个 tests 文件自己表达操作步骤；不预建通用 CpuScenario 类层次。
 
 ## 3. `simL2Cache`
 
-### `MemoryModel`
+### 稀疏内存
 
-维护 L2 自己的稀疏后备内存，支持 line 读取、line 写入、byte mask 合并和确定性初始 pattern。
+当前由 L2Model 自己持有，支持 line 读取、line 写入、byte mask 合并和确定性初始 pattern；不为此强制拆一个 MemoryModel class。测试通过运行器初始化，不通过内存回读生成 expected。
 
 ### `L2Model`
 
@@ -75,69 +75,44 @@
 - 接收 DCache 的 TXRSP/TXDAT；
 - 维护 DBID 和多拍数据状态。
 
-第一版只支持 `ReadShared` 的两拍 `RXDAT` 返回。
+第一版只支持 `ReadShared` 的两拍 `RXDAT` 返回。L2 只通过公共 `DCacheL2Link` 驱动/采样，不依赖整个 DUT 的 `DutInputs`/`DutOutputs`。
 
-### `ProbeScheduler`
+### CMO 与 Snoop
 
-第一版不主动发 Probe，但保留独立职责。后续负责按定点或条件调度 RXSNP。
+后续由同一个 L2Model 的 CMO 状态生成 RXSNP、接收 SnpResp 并发送 CompCMO，不要求独立 ProbeScheduler。真实 L2 模式由真实 RTL 完成这些事务，adapter 只做信号适配。
 
-## 4. `simLDCache`
+## 4. 测试用例与旧 `simLDCache` 的退出
 
-### `ReferenceMemory`
+已删除 `simLDCache/reference_model.h/.cpp`、`scoreboard.h/.cpp`，不再保留独立参考模型和记分牌。04 文档只保留历史用途。
 
-独立维护 CPU 可见的参考内存和初始 pattern，不读取 L2 内部 memory 对象。
+当前 `tests/single_load_miss.cpp` 只调用 do_load 和显式 tick。新增 TestContext 封装重复的采样、数据比较、结果关联和结束排空；用例配置保存可选的流量约束。后续场景沿用同一操作入口，不手写握手循环。
 
-### `ReferenceCacheLines`
+公共链路检查函数只检查字段范围和反压保持，不维护缓存权限、参考内存或通用事务表。必要检查已迁移，数据反例和缺失事件反例均确认失败；不能把删除变成取消检查。
 
-后续用于保存 cache line 数据、coherence state、dirty 状态和 Probe 相关语义。
+## 5. 仿真运行器与入口
 
-### `ProtocolChecker`
+`main.cpp` 负责参数解析、创建 Simulation/TestContext、选择测试，并在测试函数返回后调用 finish，成功排空和检查后才输出 PASS。
 
-按 cycle 和 flit 检查：
+已新增 `simulation.h/.cpp`，从原 main 提取对象管理、初始化、复位、时钟、稳定采样、边沿快照、超时和排空。测试与运行器用普通结构体交互，不访问模型私有状态。
 
-- valid/ready；
-- 反压时 payload 稳定；
-- TxnID/DBID 合法；
-- RXDAT/TXDAT 多拍顺序和字段一致性。
+下游实现选择集中在运行器。两种实现共用同一 DCacheL2Link；真正接入 RTL L2 时再添加 RtlL2Adapter 及其下游内存环境。CPU 模型和通用功能用例不依赖具体 L2 类型。
 
-### `Scoreboard`
-
-连接 CPU 操作、CHI 事务和 reference，按事务生命周期以及 CPU 最终完成点判断功能正确性。
-
-第一版只检查：
-
-- CPU Load 最终数据；
-- ReadShared TXREQ 与 RXDAT 的关联；
-- RXDAT 两拍数据正确；
-- DCache 对应的 TXRSP CompAck 合法且只被计为 CHI 事务完成；
-- `refillWakeup` 与 CPU 重发关系；
-- 正常场景不出现 `loadReplay`；
-- 活动事务最终清空。
-
-## 5. `main.cpp`
-
-负责：
-
-1. 解析测试名称和 seed；
-2. 实例化 DUT adapter、CPU model、L2 model 和 scoreboard；
-3. 执行 reset；
-4. 驱动输入并采样输出；
-5. 分发握手事件；
-6. 推进 cycle；
-7. 检查超时和最终 idle；
-8. 输出 PASS/FAIL。
-
-不实现具体测试场景和协议状态机。
+详细文件职责、采样边界及迁移顺序见 [06_simple_tests_and_replaceable_l2.md](06_simple_tests_and_replaceable_l2.md)。
 
 ## 6. `common` 的确定文件集合
 
-第一版 `common` 固定为六个文件：
+当前 `common` 包含以下公共文件：
 
 ```text
 sim/regress/common/
 ├── sim_config.h
 ├── sim_types.h
 ├── chi_types.h
+├── compact_chi_link.h
+├── chi_link_checks.h
+├── chi_link_checks.cpp
+├── compact_chi_monitor.h
+├── compact_chi_monitor.cpp
 ├── line_image.h
 ├── dut_adapter.h
 └── dut_adapter.cpp
@@ -167,7 +142,7 @@ sim/regress/common/
 - byte mask 类型；
 - 少量通用枚举，例如通道名和握手方向。
 
-不保存 CPU、L2 或 scoreboard 的内部状态，不包含 `VDCache.h`，不依赖 `simCPU`、`simL2Cache` 或 `simLDCache`。
+不保存 CPU、L2 或测试用例的内部状态，不包含 `VDCache.h`，不依赖 `simCPU`、`simL2Cache` 或测试用例。
 
 ### `chi_types.h`
 
@@ -182,6 +157,12 @@ sim/regress/common/
 - `RxSnp`。
 
 同时保存 Req、Evt、Rsp、Dat、Snp opcode 和 RespErr 常量。flit 类型只表示一次已经被采样或准备发送的 payload，不隐含 `valid`、`ready`，也不维护事务状态。
+
+### `compact_chi_link.h`
+
+定义 DCache 与 L2 间七个 ready/valid 通道的链路快照。TXREQ/TXEVT/TXRSP/TXDAT 由 DCache 发起，RXRSP/RXDAT/RXSNP 由 L2 发起。每通道共用一套 `valid`、`bits`、`ready` 表示。
+
+`DutAdapter` 负责在 Verilator DCache 端口镜像与 `DCacheL2Link` 间转换。理想 L2 和未来真实 L2 RTL adapter 都只依赖该链路类型；主循环负责在同一周期组合双方驱动值、采样 DCache 输出并把握手快照交给模型推进。
 
 ### `line_image.h`
 
@@ -219,7 +200,7 @@ sim/regress/common/
 - Store mask：64 bit；
 - 地址：48 bit。
 
-其他 common 文件、CPU model、L2 model 和 scoreboard 不直接访问 `VDCache` 生成端口。
+其他 common 文件、CPU model、L2 model 和测试用例不直接访问 `VDCache` 生成端口。
 
 ## 7. 第一版明确不放入 `common` 的内容
 
@@ -230,7 +211,17 @@ sim/regress/common/
 - `transaction_base.h`；
 - `random.h`；
 - `test_registry.h`；
-- CPU/L2/reference 专用状态机；
+- CPU/L2 专用状态机或参考模型；
 - 任何复制 DCache 内部 MSHR、way 或流水线的模型。
 
-等 `single_load_miss` 的接口和事件流确认后，再决定事件结构是否需要单独拆文件。
+保持少量普通结构体；只有实际重复使用时才抽取公共事件类型。06 中计划的 chi_link_checks 仅做局部检查，不是功能状态机。
+
+
+## 8. 内置 CHIron 协议检查
+
+`compact_chi_monitor` 复用本仓库 `third_party/chiron` 中的 Joint/Xaction，消费同一七通道边沿快照，只检查协议关联并参与排空，不驱动接口、不维护参考缓存。原 chi_link_checks 由它调用，协议错误使测试失败。外部 CHIron 路径不参与构建。详见 07 文档。
+
+
+## 9. TestContext 操作入口
+
+`do_load()` 不等待、不推进时钟；同拍可调用多次，容量不足返回 Busy。`tick()` 自动采样/检查并推进一拍；`finish()` 由运行框架显式收尾，继续检查到排空或超时。只有已提交 Load 的期望字节、只读 fixture 和数据返回关联，不维护参考缓存权限表。详细契约及验证见 06 文档第 13 节。

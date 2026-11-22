@@ -9,7 +9,8 @@
 // 旧行写回和新行的 PassDirty 共用一个 wbReq，先旧行，再新行，两笔都握手才改 array。
 // 原子没做成时走 atomicReplay：最终 I、refill error、或装成了非独占。没有 victim 时不 replay。
 // 同地址已经有 MSHR 时原子也 replay。wbBlock 和别的地址把 MSHR 占满，仍然停在 s2。
-// AMOALU 是组合逻辑，和写在同一个 s3，不再多插一拍。
+// AMOALU 只例化一个，宽度是一个 bank。算术、逻辑原子只算 wordIdx 这个字。
+// 它是组合逻辑，结果在 s3 当拍使用，不再多插一拍。AMOCAS.Q 的高半字不进 ALU。
 // storeHit、storeReplay、atomicReplay 都要握手。对端没接住，本级就不走。
 package YQH.cache
 
@@ -73,6 +74,8 @@ class MainPipeAtomicResp(implicit p: DCacheParameters) extends DCacheBundle {
 }
 
 class MainPipeMsInfo(implicit p: DCacheParameters) extends DCacheBundle {
+  // s2 里是不是 refill。只由 s2 寄存器决定，MissQueue 用它选 refillInfo。
+  val s2Refill = Bool()
   val s2Wait = Bool()
   val s2MissId = UInt(log2Up(nMissEntries).W)
   val s3Done = Bool()
@@ -201,15 +204,15 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val io = IO(new MainPipeIO)
 
   val plru = Module(new DCachePLRU)
-  val alu = Seq.fill(2)(Module(new AMOALU(DCacheWordBits)))
 
   def lineAddr(paddr: UInt): UInt =
     Cat(paddr(PAddrBits - 1, blockOffBits), 0.U(blockOffBits.W))
 
-  // set 的高 2 位是虚拟别名，不能放进物理地址。低 6 位才是 paddr[11:6]。
+  // set 高出页偏移的高位是虚拟别名，不能放进物理地址。低位才是页内物理 index。
   def victimAddr(tag: UInt, set: UInt): UInt = {
-    val low = idxBits - chi.tagAliasBits
-    Cat(tag(tagBits - 1, 0), set(low - 1, 0), 0.U(blockOffBits.W))
+    val inPageBits = idxBits - tagAliasBits
+    if (inPageBits == 0) Cat(tag(tagBits - 1, 0), 0.U(blockOffBits.W))
+    else Cat(tag(tagBits - 1, 0), set(inPageBits - 1, 0), 0.U(blockOffBits.W))
   }
 
   def snpWantsData(op: UInt, coh: UInt, need: Bool): Bool = {
@@ -231,7 +234,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     ))
 
   def idxAddr(paddr: UInt, set: UInt): UInt =
-    Cat(paddr(PAddrBits - 1, 14), set(idxBits - 1, 0), paddr(5, 0))
+    Cat(paddr(PAddrBits - 1, untagBits), set(idxBits - 1, 0), paddr(blockOffBits - 1, 0))
 
   def hasWrite(coh: UInt): Bool =
     coh === MetaState.UC || coh === MetaState.UD
@@ -304,6 +307,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val atomicCan = !setBlocked(atomicSet) && portFree
 
   io.probe.ready := probeCan
+  // 不同 set 的 refill 可以同时待在 s1、s2、s3。同 set 由 setBlocked 挡住。
   io.refill.ready := refillCan && !(io.probe.valid && probeCan)
   io.store.ready := storeCan && !(io.probe.valid && probeCan) && !(io.refill.valid && refillCan)
   io.atomic.ready := atomicCan && !(io.probe.valid && probeCan) &&
@@ -567,6 +571,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val s2_done = s2_fire || missLeave
   s2_ready := !s2_valid || s2_done
 
+  io.mainpipeInfo.s2Refill := s2_refill
   io.mainpipeInfo.s2Wait := s2_refill && !io.refillInfo.valid
   io.mainpipeInfo.s2MissId := s2_hold.missId
 
@@ -635,15 +640,12 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val old0 = Wire(UInt(DCacheWordBits.W))
   val old1 = Wire(UInt(DCacheWordBits.W))
   val twoBanks3 = isAMOCASQ(s3_hold.cmd) || s3_hold.amoMask(QuadWordBytes - 1, DCacheWordBytes).orR
-  for (i <- 0 until 2) {
-    alu(i).io.cmd := s3_hold.cmd
-  }
-  alu(0).io.lhs := old0
-  alu(0).io.rhs := s3_hold.amoData(DCacheWordBits - 1, 0)
-  alu(0).io.mask := s3_hold.amoMask(DCacheWordBytes - 1, 0)
-  alu(1).io.lhs := old1
-  alu(1).io.rhs := s3_hold.amoData(QuadWordBits - 1, DCacheWordBits)
-  alu(1).io.mask := s3_hold.amoMask(QuadWordBytes - 1, DCacheWordBytes)
+  // 只算 wordIdx 对应的那一个 bank。AMOCAS.Q 的另一个 bank 在下面按 mask 合并。
+  val amoalu = Module(new AMOALU(DCacheWordBits))
+  amoalu.io.cmd := s3_hold.cmd
+  amoalu.io.lhs := old0
+  amoalu.io.rhs := s3_hold.amoData(DCacheWordBits - 1, 0)
+  amoalu.io.mask := s3_hold.amoMask(DCacheWordBytes - 1, 0)
 
   val old128 = Cat(old1, old0)
   val casMismatch = ((old128 ^ s3_hold.amoCmp) & FillInterleaved(8, s3_hold.amoMask)).orR
@@ -696,21 +698,22 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
     s3_hold.amoMask(DCacheWordBytes - 1, 0))
   val atomicHigh = mergeWord(old1, s3_hold.amoData(QuadWordBits - 1, DCacheWordBits),
     s3_hold.amoMask(QuadWordBytes - 1, DCacheWordBytes))
-  val hitAtomicWrite = s3_alu || ((s3_cas && !casFail) || scOk)
   val atomicWords = VecInit((0 until DCacheBanks).map { b =>
     val is0 = b.U === bank0
     val is1 = b.U === bank1
     val touched = is0 || (is1 && twoBanks3)
     val base = Mux(s3_refill_req, refillWords(b), s3_word(b))
-    val useAlu = touched && (s3_alu || (refillMutate && cmdIsAlu))
+    val useAlu = is0 && (s3_alu || (refillMutate && cmdIsAlu))
     val useMerge = touched && !useAlu &&
       (scOk || ((s3_cas || (refillMutate && cmdIsCas)) && !casFail))
-    Mux(useAlu, Mux(is0, alu(0).io.out, alu(1).io.out),
+    Mux(useAlu, amoalu.io.out,
       Mux(useMerge, Mux(is0, atomicLow, atomicHigh), base))
   })
-  val atomicBanks = Mux(hitAtomicWrite,
-    UIntToOH(bank0, DCacheBanks) | Mux(twoBanks3, UIntToOH(bank1, DCacheBanks), 0.U(DCacheBanks.W)),
-    0.U(DCacheBanks.W))
+  val pairBanks = UIntToOH(bank0, DCacheBanks) |
+    Mux(twoBanks3, UIntToOH(bank1, DCacheBanks), 0.U(DCacheBanks.W))
+  // 算术、逻辑原子只写 wordIdx。跨两个 bank 的是 CAS、SC，不是第二个 ALU。
+  val atomicBanks = Mux(s3_alu, UIntToOH(bank0, DCacheBanks),
+    Mux((s3_cas && !casFail) || scOk, pairBanks, 0.U(DCacheBanks.W)))
   val doAtomicData = s3_atomic && atomicBanks.orR
   val doAtomicMeta = doAtomicData && s3_coh =/= MetaState.UD
 
@@ -837,7 +840,7 @@ class MainPipe(implicit p: DCacheParameters) extends DCacheModule with MemoryOpC
   val snpDrop = s3_hold.probeOp === CompactChiOpcode.Snp.SnpMakeInvalid
   io.snoopNotice.valid := s3_done && s3_probe && snpDrop
   io.snoopNotice.bits.addr := lineAddr(s3_hold.addr)
-  io.snoopNotice.bits.alias := s3_hold.vaddr(13, 12)
+  io.snoopNotice.bits.alias := get_tag_alias(s3_hold.vaddr)
   io.snoopNotice.bits.finalCoh := MetaState.I
   io.snoopNotice.bits.takeBuffer := false.B
   io.snoopNotice.bits.drop := true.B

@@ -4,6 +4,8 @@
 // 当前 Data 是 8 块 SRAM，每块一次读出 4 路。s1 即使已经知道真实 way，
 // 仍然读该 bank 的全部 way，s2 再按命中 way 挑选。miss 和软件预取不读 Data。
 // replayCarry 只随 replay 交还 LSU。重发仍从 s0 的 tag 比较开始，不用它直接选数据。
+// s2 只活一拍。LSU 的 resp.ready 必须为 1，不能停住再锁 hit、replay、handled 和 mshr id。
+// 停住后重算会把同一条 load 再次送进 MissQueue。s0 仍可能等 Tag 写口。
 package YQH.cache
 
 import chisel3._
@@ -49,7 +51,8 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
   assert(io.meta_read.ready, "meta read port must stay ready")
 
   val s1_ready = Wire(Bool())
-  val s2_ready = Wire(Bool())
+  // 与香山一致：s2 不反压，s1 不会被 s2 挡住。
+  val s2_ready = true.B
 
   def lineAddr(paddr: UInt): UInt =
     Cat(paddr(PAddrBits - 1, blockOffBits), 0.U(blockOffBits.W))
@@ -85,6 +88,7 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
   val s1_tag_hit = s1_tag_way.orR
   val s1_meta = Mux1H(s1_tag_way, io.meta_resp)
   val s1_prefetch_w = s1_req.cmd === M_PFW
+  // 普通load和读预取只要tag hit了就算命中。权限升级必须有写权限才算命中。
   val s1_hit = s1_tag_hit && (!s1_prefetch_w || hasWritePerm(s1_meta.coh))
   val s1_upgrade = s1_tag_hit && s1_prefetch_w && !s1_hit
   // 普通 load 命中才读数据。预取不返回数据，miss 和权限升级也不读。
@@ -140,26 +144,21 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
   val s2_bank_conflict = RegEnable(s1_bank_conflict, s1_go)
   val s2_need_data = RegEnable(s1_need_data && io.banked_data_read.fire, s1_go)
 
-  val s2_latched = RegInit(false.B)
-  val s2_latch_replay = RegInit(false.B)
-  val s2_latch_handled = RegInit(false.B)
-  val s2_latch_hit = RegInit(false.B)
-  val s2_latch_id = Reg(UInt(log2Up(nMissEntries).W))
-  val s2_latch_nack = RegInit(false.B)
-
   val s2_kill = io.lsu.s2_kill
   val s2_prefetch = isPrefetch(s2_req.cmd)
-  val s2_first = s2_valid && !s2_latched && !s2_kill
-  val s2_block_addr = lineAddr(s2_paddr)
+  // 这一拍就是唯一的一次判定。kill 不回答，也不再发 miss。
+  val s2_issue = s2_valid && !s2_kill
+  val s2_block_addr = lineAddr(s2_paddr) //只找cacheline的地址，低3位直接为0
 
-  io.wbq_conflict_check.valid := s2_first && !s2_hit && !s2_bank_conflict
+  io.wbq_conflict_check.valid := s2_issue && !s2_hit && !s2_bank_conflict
   io.wbq_conflict_check.bits := s2_block_addr
   io.unique_occupy_valid := s2_valid && s2_upgrade
   io.unique_occupy_set := Mux(io.unique_occupy_valid, get_idx(s2_req.vaddr), 0.U)
 
   val wb_block = io.wbq_block_miss_req
   val occupy_cancel = s2_upgrade && io.unique_occupy_fail
-  val send_miss = s2_first && !s2_hit && !s2_bank_conflict && !wb_block && !occupy_cancel
+  val send_miss = s2_issue && !s2_hit && !s2_bank_conflict && !wb_block && !occupy_cancel
+  // s2申请miss
   io.miss_req.valid := send_miss
   io.miss_req.bits.source := Mux(s2_prefetch, SOFT_PREFETCH.U, LOAD_SOURCE.U)
   io.miss_req.bits.cmd := s2_req.cmd
@@ -182,18 +181,12 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
 
   val send_ok = io.miss_req.fire && io.miss_resp.handled
   val send_fail = send_miss && (!io.miss_req.ready || !io.miss_resp.handled)
-  val raw_replay = s2_first && !s2_prefetch && (s2_bank_conflict || (!s2_hit && (wb_block || occupy_cancel || send_fail)))
-  val raw_hit = s2_first && s2_hit && !s2_bank_conflict
-  val raw_handled = send_ok
+  val resp_replay = s2_issue && !s2_prefetch && (s2_bank_conflict || (!s2_hit && (wb_block || occupy_cancel || send_fail)))
+  val resp_hit = s2_issue && s2_hit && !s2_bank_conflict
+  val resp_handled = send_ok
   // 没被 MissArb 选中时，missResp 属于另一条请求，不能把别人的 MSHR 号发出去。
-  val raw_id = Mux(io.miss_req.fire, io.miss_resp.id, 0.U)
-  val raw_nack = send_fail
-
-  val resp_replay = Mux(s2_latched, s2_latch_replay, raw_replay)
-  val resp_hit = Mux(s2_latched, s2_latch_hit, raw_hit)
-  val resp_handled = Mux(s2_latched, s2_latch_handled, raw_handled)
-  val resp_id = Mux(s2_latched, s2_latch_id, raw_id)
-  val resp_nack = Mux(s2_latched, s2_latch_nack, raw_nack)
+  val resp_id = Mux(io.miss_req.fire, io.miss_resp.id, 0.U)
+  val resp_nack = send_fail
 
   val low_word = io.banked_data_resp(0).data(s2_way)
   val high_word = io.banked_data_resp(1).data(s2_way)
@@ -222,21 +215,13 @@ class LoadPipe(id: Int)(implicit p: DCacheParameters) extends DCacheModule with 
   io.lsu.s2_wpu_pred_fail := false.B
   io.lsu.s2_mq_nack := s2_valid && resp_nack
 
-  val s2_done = s2_valid && (s2_kill || io.lsu.resp.fire)
-  s2_ready := !s2_valid || s2_done
+  // kill 不产生响应，这一级仍然必须离开，否则下一条 s1 会盖掉它。
+  val s2_leave = s2_kill || io.lsu.resp.fire
   when(s1_go) { s2_valid := true.B }
-    .elsewhen(s2_done) { s2_valid := false.B }
+    .elsewhen(s2_valid && s2_leave) { s2_valid := false.B }
 
-  when(s2_done || s2_kill) {
-    s2_latched := false.B
-  }.elsewhen(s2_valid && !s2_latched && !io.lsu.resp.ready) {
-    s2_latched := true.B
-    s2_latch_replay := raw_replay
-    s2_latch_handled := raw_handled
-    s2_latch_hit := raw_hit
-    s2_latch_id := raw_id
-    s2_latch_nack := raw_nack
-  }
+  assert(!(io.lsu.resp.valid && !io.lsu.resp.ready), "lsu should be ready in s2")
+  assert(s1_ready && s2_ready, "load pipeline should never be blocked")
 
   assert(!(io.lsu.resp.valid && resp_hit && resp_replay), "hit and replay are mutually exclusive")
   assert(!(io.lsu.resp.valid && resp_hit && resp_handled), "hit and accept are mutually exclusive")

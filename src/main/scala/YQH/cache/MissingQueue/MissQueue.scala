@@ -252,9 +252,9 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
   def lineOf(addr: UInt): UInt =
     Cat(addr(PAddrBits - 1, blockOffBits), 0.U(blockOffBits.W))
 
-  def aliasOf(vaddr: UInt): UInt = vaddr(13, 12)
+  def aliasOf(vaddr: UInt): UInt = get_tag_alias(vaddr)
 
-  def setOf(addr: UInt, alias: UInt): UInt = Cat(alias, addr(11, 6))
+  def setOf(addr: UInt, alias: UInt): UInt = dcacheSet(alias, addr)
 
   def overlay(base: UInt, neu: UInt, mask: UInt, nbytes: Int): UInt = {
     val bytes = Wire(Vec(nbytes, UInt(8.W)))
@@ -352,11 +352,12 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
   val txId = PriorityEncoder(txWant.asUInt)
   val opcodeFrozen = txValid && txId === matchId
 
+  // 每一项自己用 refillInflight 保证最多一笔在途，不再因为别的项在 MainPipe 里就停发。
+  // 同 set 由 MainPipe 拒绝；这里每拍只选出编号最小的一项。
   val eligible = VecInit(entries.map { e =>
     e.busy && e.dataDone && !e.refillDone && !e.refillInflight && !e.waitVictim
   })
-  val anyInflight = entries.map(_.refillInflight).reduce(_ || _)
-  val refillValid = eligible.asUInt.orR && !anyInflight
+  val refillValid = eligible.asUInt.orR
   val refillId = PriorityEncoder(eligible.asUInt)
   val sendingRefill = refillValid && refillId === matchId
   val mergeWindow = matched && !matchedEntry.refillSent && !matchedEntry.refillInflight &&
@@ -836,10 +837,13 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
 
   io.refill.valid := refillValid
   io.refill.bits := pipeReq(entries(refillId), refillId)
-  val infoEntry = entries(Mux(anyInflight, PriorityEncoder(VecInit(entries.map(_.refillInflight)).asUInt), refillId))
-  io.refillInfo.valid := anyInflight
+  // 按当前 s2 的 missId 取这一项。s1、s3 里的其它 refill 不占用这条侧带。
+  // s2Refill 来自 s2 寄存器，不看 refillInfo.valid，避免组合环。
+  val infoEntry = entries(io.mainpipeInfo.s2MissId)
+  io.refillInfo.valid := io.mainpipeInfo.s2Refill && infoEntry.busy &&
+    infoEntry.refillInflight && infoEntry.dataDone
   io.refillInfo.bits := refillView(infoEntry)
-  io.refillError := infoEntry.error
+  io.refillError := io.refillInfo.valid && infoEntry.error
 
   // 只看已经记进项里的 Snoop。当拍的 snoop 由 refillView 带给还在 s2 的 refill。
   // 若这里再看当拍 snoop，会和 MainPipe s3 的完成条件绕成组合环。
@@ -852,14 +856,19 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
   io.pendingInvalidate := io.pendingQuery.valid && pendingEntry.busy &&
     (dropNow || (pendingEntry.pendingSnoop && pendingEntry.snoopFinal === MetaState.I))
 
+  // 按路计，不按 MSHR 项计。各路 one-hot 先按位或，再数有几路；两项挤在同一路只占 1。
+  // 4 路时已经有 3 路才失败，给后面的真 miss 留 1 路 victim。
+  // 香山的 miss_req_pipe_reg 只补“已收下、项还没写上”的那一拍。这里 doAlloc
+  // 在收下的沿上就写 isUpgrade/way，下一拍项里已经能看到，正好盖住那一拍。
   for (pidx <- 0 until 3) {
     val hit = entries.map { e =>
       e.busy && e.isUpgrade && !e.refillDone &&
         setOf(e.addr, e.alias) === io.occupySet(pidx).bits
     }
     val ways = entries.zip(hit).map { case (e, h) => Mux(h, e.way, 0.U) }
-    io.occupyWay(pidx) := ways.reduce(_ | _)
-    io.occupyFail(pidx) := io.occupySet(pidx).valid && PopCount(hit) >= 3.U
+    val wayMask = ways.reduce(_ | _)
+    io.occupyWay(pidx) := wayMask
+    io.occupyFail(pidx) := io.occupySet(pidx).valid && PopCount(wayMask) > (nways - 2).U
   }
 
   io.replaceBlock := io.replaceQuery.valid && entries.map { e =>
@@ -903,7 +912,13 @@ class MissQueue(implicit p: DCacheParameters) extends DCacheModule with MemoryOp
 
   assert(!io.missReq.valid || PopCount(matchVec.asUInt) <= 1.U,
     "one in-flight miss per physical line and alias")
-  assert(PopCount(entries.map(_.refillInflight)) <= 1.U, "only one refill may be in MainPipe")
+  val refillSetClash = entries.indices.flatMap { i =>
+    entries.indices.drop(i + 1).map { j =>
+      entries(i).refillInflight && entries(j).refillInflight &&
+        setOf(entries(i).addr, entries(i).alias) === setOf(entries(j).addr, entries(j).alias)
+    }
+  }.reduce(_ || _)
+  assert(!refillSetClash, "two refills in MainPipe must not share a set")
   assert(!allowAlloc || !req.scToUnique || PopCount(req.occupy_way) === 1.U,
     "SC to Unique must name exactly one way")
   assert(!io.cmoReq.fire || io.cmoReq.bits.opcode === CmoOpcode.CLEAN ||
